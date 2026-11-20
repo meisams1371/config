@@ -804,6 +804,7 @@ _RAMZINEX_PROXY_REFRESH_SECONDS = max(
     180, min(3600, int(os.environ.get("RAMZINEX_PROXY_REFRESH_SECONDS", "600")))
 )
 _RAMZINEX_PROXY_POOL_SIZE = 5
+_RAMZINEX_WS_VERIFY_LIMIT = 12
 # Previously verified public endpoints are treated only as candidates. They are
 # re-tested from scratch on every refresh and never trusted or used blindly.
 _RAMZINEX_LAST_KNOWN_PROXY_CANDIDATES = (
@@ -939,7 +940,7 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
                 return None
 
         ws_results = await asyncio.gather(*(
-            verify_websocket(row) for row in http_ready[:_RAMZINEX_PROXY_POOL_SIZE]
+            verify_websocket(row) for row in http_ready[:_RAMZINEX_WS_VERIFY_LIMIT]
         ))
         ready = [row for row in ws_results if row]
         ready.sort(key=lambda row: (
