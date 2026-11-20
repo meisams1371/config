@@ -34,7 +34,7 @@ jobs:
           # ProxySpace candidate parsing is intentionally not an attestation:
           # each endpoint must still pass live GeoIP, REST, and WebSocket checks.
           proxyspace_rows = relay_app._proxyspace_candidates(
-              "185.129.213.210:8080\\n178.252.134.190:3128\\ninvalid:port",
+              "185.129.213.210:8080\n178.252.134.190:3128\ninvalid:port",
               "80.191.46.62:1099\\n",
           )
           assert len(proxyspace_rows) == 3, proxyspace_rows
