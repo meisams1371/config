@@ -25,8 +25,12 @@ IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 app = FastAPI(title="X4G", docs_url=None, redoc_url=None)
 
-# Isolated, read-only Ramzinex probe mounted under /egress.
-from relay_app import app as egress_probe_app
+# Isolated, read-only Ramzinex relay with a self-healing Iran egress pool.
+from relay_app import (
+    app as egress_probe_app,
+    start_proxy_manager as start_ramzinex_proxy_manager,
+    stop_proxy_manager as stop_ramzinex_proxy_manager,
+)
 app.mount("/egress", egress_probe_app)
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -211,6 +215,10 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    # Discover and maintain verified Iranian egress routes in the background.
+    # This does not block X4G startup; the relay reports unavailable until a route
+    # passes GeoIP and real Ramzinex public GET checks.
+    await start_ramzinex_proxy_manager()
     # Create a disposable, limited VLESS test link only on this isolated test branch.
     test_uid = os.environ.get("RADAR_VLESS_TEST_UUID", "").strip()
     if test_uid:
@@ -239,6 +247,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    await stop_ramzinex_proxy_manager()
     await save_state()
     await _tg_stop_bot()
     if http_client:
