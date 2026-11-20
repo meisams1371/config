@@ -43,6 +43,7 @@ jobs:
                   "checked_at": report.get("checked_at"),
                   "http_candidates": report.get("http_candidates"),
                   "http_tested": report.get("http_tested"),
+                  "http_diagnostics": report.get("http_diagnostics"),
                   "iran_http_exits": [
                       {
                           "proxy": row.get("proxy"),
