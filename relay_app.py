@@ -15,14 +15,18 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import html
+import ipaddress
+import json
 import logging
 import os
 import re
+import socket
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Deque
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -222,6 +226,445 @@ def _json_summary(name: str, status: int, body: bytes) -> dict:
         ),
         "top_level_keys": keys,
     }
+
+
+# ── Daily Iranian proxy discovery ────────────────────────────────────────────
+# Selector's option 13 is an MTProto-only finder. Its public source contains
+# Telegram proxy links; we separately check TCP reachability and resolve the
+# endpoint IP's country. A TCP-open result is NOT called a confirmed Telegram
+# handshake. For Ramzinex, only HTTP/HTTPS proxies that pass IP + GeoIP +
+# read-only exchange API checks are reported as usable.
+HTTP_PROXY_SOURCE = (
+    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
+    "proxies/countries/IR/data.json"
+)
+MTPROTO_SOURCE = (
+    "https://raw.githubusercontent.com/Kolandone/v2raycollector/main/proxy.txt"
+)
+IP_ECHO_URL = "https://api.ipify.org?format=json"
+RAMZINEX_PAIRS_URL = BASE + "/exchange/api/v1.0/exchange/pairs/2"
+RAMZINEX_ORDERBOOK_URL = BASE + "/exchange/api/v1.0/exchange/orderbooks/2/buys_sells"
+_scan_cache: dict | None = None
+_scan_cache_at = 0.0
+_scan_lock = asyncio.Lock()
+_SCAN_TTL_SECONDS = 1800
+_HTTP_SCAN_LIMIT = max(8, min(36, int(os.environ.get("IRAN_PROXY_SCAN_LIMIT", "24"))))
+_MTPROTO_SCAN_LIMIT = max(8, min(36, int(os.environ.get("IRAN_MTPROTO_SCAN_LIMIT", "20"))))
+_DIRECT_TIMEOUT = httpx.Timeout(connect=4.0, read=6.0, write=4.0, pool=3.0)
+
+
+def _public_ip(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+        return address.is_global
+    except Exception:
+        return False
+
+
+async def _geoip_votes(client: httpx.AsyncClient, ip: str) -> dict:
+    """Two-of-three independent GeoIP votes. These requests go direct, not via proxy."""
+    checks = {
+        "ipwho": f"https://ipwho.is/{ip}",
+        "ipapi": f"https://ipapi.co/{ip}/json/",
+        "ip_api": f"http://ip-api.com/json/{ip}?fields=status,countryCode,city,isp,as",
+    }
+
+    async def one(name: str, url: str):
+        try:
+            response = await client.get(url, timeout=5.0)
+            if response.status_code != 200:
+                return name, None
+            data = response.json()
+            if name == "ipwho":
+                if not data.get("success"):
+                    return name, None
+                country = data.get("country_code")
+                city = data.get("city")
+            elif name == "ipapi":
+                country = data.get("country_code")
+                city = data.get("city")
+            else:
+                if data.get("status") != "success":
+                    return name, None
+                country = data.get("countryCode")
+                city = data.get("city")
+            return name, {
+                "country": str(country or "").upper(),
+                "city": city,
+            }
+        except Exception:
+            return name, None
+
+    results = await asyncio.gather(*(one(k, v) for k, v in checks.items()))
+    votes = {}
+    for name, item in results:
+        if item and item.get("country"):
+            votes[name] = item
+    iran_votes = sum(1 for item in votes.values() if item["country"] == "IR")
+    return {
+        "votes": votes,
+        "iran_votes": iran_votes,
+        "vote_count": len(votes),
+        "iran_confirmed": iran_votes >= 2,
+        "city": next(
+            (item.get("city") for item in votes.values()
+             if item.get("country") == "IR" and item.get("city")),
+            None,
+        ),
+    }
+
+
+def _http_proxy_candidates(payload: object) -> list[dict]:
+    if not isinstance(payload, list):
+        return []
+    rows = []
+    seen = set()
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        proxy = str(item.get("proxy") or "").strip()
+        try:
+            parsed = urlsplit(proxy)
+            if parsed.scheme not in ("http", "https"):
+                continue
+            if not parsed.hostname or not parsed.port:
+                continue
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                continue
+            ip = str(item.get("ip") or parsed.hostname)
+            address = ipaddress.ip_address(ip)
+            if not address.is_global:
+                continue
+            if parsed.hostname != ip:
+                continue
+            key = f"{parsed.scheme}://{ip}:{parsed.port}"
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "proxy": key,
+                "ip": ip,
+                "port": parsed.port,
+                "scheme": parsed.scheme,
+                "anonymity": str(item.get("anonymity") or "unknown"),
+                "listed_city": str((item.get("geolocation") or {}).get("city") or "Unknown"),
+                "score": int(item.get("score") or 0),
+            })
+        except Exception:
+            continue
+
+    # Re-test the endpoint that previously passed the Iran + Ramzinex checks first.
+    rows.sort(key=lambda row: (
+        row["ip"] != "2.179.95.57",
+        row["anonymity"] != "elite",
+        row["score"] * -1,
+        row["listed_city"] == "Unknown",
+    ))
+    return rows[:_HTTP_SCAN_LIMIT]
+
+
+async def _test_http_proxy(candidate: dict, direct_client: httpx.AsyncClient) -> dict:
+    proxy_url = candidate["proxy"]
+    started = time.monotonic()
+    result = {
+        "proxy": proxy_url,
+        "ip": candidate["ip"],
+        "port": candidate["port"],
+        "anonymity": candidate["anonymity"],
+        "listed_city": candidate["listed_city"],
+    }
+    try:
+        async with httpx.AsyncClient(
+            proxies=proxy_url,
+            timeout=_DIRECT_TIMEOUT,
+            follow_redirects=False,
+            trust_env=False,
+            headers={
+                "User-Agent": "X4G-Iran-Proxy-Audit/1.0",
+                "Accept": "application/json",
+            },
+        ) as proxy_client:
+            # The observed exit IP must be read through the candidate proxy.
+            echo = await proxy_client.get(IP_ECHO_URL)
+            if echo.status_code != 200:
+                return {**result, "status": "ip_echo_failed", "http_status": echo.status_code}
+            try:
+                exit_ip = str(echo.json().get("ip") or "")
+            except Exception:
+                exit_ip = ""
+            if not _public_ip(exit_ip):
+                return {**result, "status": "invalid_exit_ip"}
+
+            # GeoIP lookups are direct queries for the observed proxy exit IP.
+            geo = await _geoip_votes(direct_client, exit_ip)
+            result["exit_ip"] = exit_ip
+            result["geoip"] = geo
+            if not geo["iran_confirmed"]:
+                return {
+                    **result,
+                    "status": "not_confirmed_iran",
+                    "latency_ms": round((time.monotonic() - started) * 1000),
+                }
+
+            pair_started = time.monotonic()
+            pairs = await proxy_client.get(RAMZINEX_PAIRS_URL)
+            pair_ms = round((time.monotonic() - pair_started) * 1000)
+            book_started = time.monotonic()
+            book = await proxy_client.get(RAMZINEX_ORDERBOOK_URL)
+            book_ms = round((time.monotonic() - book_started) * 1000)
+
+            pair_json = False
+            book_json = False
+            try:
+                pair_data = pairs.json()
+                pair_json = isinstance(pair_data, (dict, list))
+            except Exception:
+                pass
+            try:
+                book_data = book.json()
+                book_json = isinstance(book_data, (dict, list))
+            except Exception:
+                pass
+
+            result.update({
+                "pairs_status": pairs.status_code,
+                "pairs_json": pair_json,
+                "pairs_ms": pair_ms,
+                "orderbook_status": book.status_code,
+                "orderbook_json": book_json,
+                "orderbook_ms": book_ms,
+                "latency_ms": round((time.monotonic() - started) * 1000),
+            })
+            result["ramzinex_ready"] = (
+                pairs.status_code == 200 and pair_json
+                and book.status_code == 200 and book_json
+            )
+            result["status"] = "ramzinex_ready" if result["ramzinex_ready"] else "iran_exit_only"
+            return result
+    except Exception as exc:
+        return {
+            **result,
+            "status": "connection_failed",
+            "error": type(exc).__name__,
+            "latency_ms": round((time.monotonic() - started) * 1000),
+        }
+
+
+async def _resolve_mtproto_candidate(
+    host: str, port: int, secret: str, direct_client: httpx.AsyncClient
+) -> dict | None:
+    started = time.monotonic()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=3.5
+        )
+        peer = writer.get_extra_info("peername")
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        if not peer or not _public_ip(str(peer[0])):
+            return None
+        ip = str(peer[0])
+        geo = await _geoip_votes(direct_client, ip)
+        if not geo["iran_confirmed"]:
+            return None
+        link = "https://t.me/proxy?" + urlencode({
+            "server": host,
+            "port": str(port),
+            "secret": secret,
+        })
+        return {
+            "host": host,
+            "port": port,
+            "ip": ip,
+            "city": geo.get("city") or "Iran",
+            "geoip": geo,
+            "tcp_ms": round((time.monotonic() - started) * 1000),
+            "link": link,
+            "protocol": "MTProto",
+            "telegram_handshake_verified": False,
+        }
+    except Exception:
+        return None
+
+
+async def _scan_mtproto(direct_client: httpx.AsyncClient) -> list[dict]:
+    try:
+        response = await direct_client.get(MTPROTO_SOURCE, timeout=8.0)
+        response.raise_for_status()
+        lines = response.text.splitlines()
+    except Exception as exc:
+        logger.warning("MTProto source fetch failed: %s", type(exc).__name__)
+        return []
+
+    parsed = []
+    seen = set()
+    for line in lines:
+        line = line.strip()
+        if not line.startswith("https://t.me/proxy?"):
+            continue
+        try:
+            query = parse_qs(urlsplit(line).query)
+            host = (query.get("server") or [""])[0].strip()
+            port = int((query.get("port") or ["0"])[0])
+            secret = (query.get("secret") or [""])[0].strip()
+            if not host or not secret or not (1 <= port <= 65535):
+                continue
+            key = (host.lower(), port, secret)
+            if key in seen:
+                continue
+            seen.add(key)
+            parsed.append((host, port, secret))
+        except Exception:
+            continue
+
+    # Hostnames suggesting Iranian endpoints are tried first, but never treated
+    # as country evidence; only independent GeoIP votes can label them Iranian.
+    parsed.sort(key=lambda item: not any(
+        marker in item[0].lower()
+        for marker in ("ir", "tehran", "shomal", "foriran")
+    ))
+    parsed = parsed[:_MTPROTO_SCAN_LIMIT]
+    semaphore = asyncio.Semaphore(6)
+
+    async def bounded(item):
+        async with semaphore:
+            return await _resolve_mtproto_candidate(*item, direct_client)
+
+    results = await asyncio.gather(*(bounded(item) for item in parsed))
+    return sorted(
+        [item for item in results if item],
+        key=lambda row: row["tcp_ms"],
+    )
+
+
+async def scan_iran_proxies(force: bool = False) -> dict:
+    """Discover and verify Iran HTTP proxies and Telegram-only MTProto endpoints."""
+    global _scan_cache, _scan_cache_at
+    now = time.monotonic()
+    if not force and _scan_cache is not None and now - _scan_cache_at < _SCAN_TTL_SECONDS:
+        return {**_scan_cache, "cached": True}
+
+    async with _scan_lock:
+        now = time.monotonic()
+        if not force and _scan_cache is not None and now - _scan_cache_at < _SCAN_TTL_SECONDS:
+            return {**_scan_cache, "cached": True}
+
+        async with httpx.AsyncClient(
+            timeout=_DIRECT_TIMEOUT,
+            follow_redirects=False,
+            trust_env=False,
+            headers={"User-Agent": "X4G-Iran-Proxy-Discovery/1.0"},
+        ) as direct_client:
+            try:
+                source_response = await direct_client.get(HTTP_PROXY_SOURCE, timeout=10.0)
+                source_response.raise_for_status()
+                source_payload = source_response.json()
+            except Exception as exc:
+                source_payload = []
+                logger.warning("Iran HTTP proxy source fetch failed: %s", type(exc).__name__)
+
+            candidates = _http_proxy_candidates(source_payload)
+            semaphore = asyncio.Semaphore(6)
+
+            async def bounded(candidate):
+                async with semaphore:
+                    return await _test_http_proxy(candidate, direct_client)
+
+            http_results = await asyncio.gather(*(bounded(candidate) for candidate in candidates))
+            mtproto_results = await _scan_mtproto(direct_client)
+
+        iran_http = [row for row in http_results if row.get("geoip", {}).get("iran_confirmed")]
+        ramzinex_ready = [row for row in iran_http if row.get("ramzinex_ready")]
+        iran_http.sort(key=lambda row: (
+            not row.get("ramzinex_ready"),
+            row.get("latency_ms", 999999),
+        ))
+        report = {
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "source_http": HTTP_PROXY_SOURCE,
+            "source_mtproto": MTPROTO_SOURCE,
+            "http_candidates": len(candidates),
+            "http_tested": len(http_results),
+            "iran_http_exits": iran_http,
+            "ramzinex_ready": ramzinex_ready,
+            "mtproto_iran_tcp": mtproto_results,
+            "mtproto_note": "TCP and GeoIP checked; Telegram MTProto handshake not verified.",
+        }
+        _scan_cache = report
+        _scan_cache_at = time.monotonic()
+        return {**report, "cached": False}
+
+
+async def build_daily_proxy_report(force: bool = False) -> str:
+    report = await scan_iran_proxies(force=force)
+    checked = report.get("checked_at", "")
+    try:
+        checked_display = datetime.fromisoformat(checked).astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        checked_display = checked or "نامشخص"
+
+    lines = [
+        "🇮🇷 <b>گزارش روزانهٔ پروکسی‌های ایران</b>",
+        f"زمان بررسی: <code>{html.escape(checked_display)}</code>",
+        "",
+        f"پروکسی‌های HTTP/HTTPS بررسی‌شده: <b>{report.get('http_tested', 0)}</b>",
+        f"خروجی ایران با حداقل ۲ تأیید GeoIP: <b>{len(report.get('iran_http_exits', []))}</b>",
+        f"قابل‌استفاده برای API عمومی رمزینکس: <b>{len(report.get('ramzinex_ready', []))}</b>",
+    ]
+
+    ready = report.get("ramzinex_ready", [])[:5]
+    if ready:
+        lines.extend(["", "✅ <b>پروکسی‌های تأییدشده برای رمزینکس</b>"])
+        for index, row in enumerate(ready, 1):
+            city = html.escape(str(row.get("geoip", {}).get("city") or "ایران"))
+            endpoint = html.escape(f"{row.get('ip')}:{row.get('port')}")
+            latency = row.get("latency_ms", "?")
+            lines.append(
+                f"{index}) <code>{endpoint}</code> — {city} — {latency} ms "
+                f"(Pairs {row.get('pairs_status')}, Orderbook {row.get('orderbook_status')})"
+            )
+    else:
+        lines.extend([
+            "",
+            "⚠️ امروز هیچ HTTP/HTTPS پروکسی با تأیید خروجی ایران و پاسخ موفق هر دو API رمزینکس پیدا نشد.",
+        ])
+
+    other_exits = [
+        row for row in report.get("iran_http_exits", [])
+        if not row.get("ramzinex_ready")
+    ][:3]
+    if other_exits:
+        lines.extend(["", "🌐 <b>خروجی ایران؛ هنوز برای رمزینکس تأیید نشده</b>"])
+        for index, row in enumerate(other_exits, 1):
+            lines.append(
+                f"{index}) <code>{html.escape(str(row.get('ip')))}:{row.get('port')}</code> "
+                f"— API رمزینکس: {row.get('pairs_status', 'نامشخص')}/"
+                f"{row.get('orderbook_status', 'نامشخص')}"
+            )
+
+    mtproto = report.get("mtproto_iran_tcp", [])[:5]
+    if mtproto:
+        lines.extend([
+            "",
+            "📨 <b>پروکسی‌های MTProto ایران برای خود تلگرام</b>",
+            "<i>فقط TCP و موقعیت IP بررسی شده؛ اتصال کامل پروتکل تلگرام تضمین نشده است.</i>",
+        ])
+        for index, row in enumerate(mtproto, 1):
+            link = html.escape(str(row.get("link", "")), quote=True)
+            host = html.escape(str(row.get("host", "")))
+            city = html.escape(str(row.get("city", "ایران")))
+            lines.append(f'{index}) <a href="{link}">{host}:{row.get("port")}</a> — {city}')
+
+    lines.extend([
+        "",
+        "<i>هشدار امنیتی: پروکسی‌های عمومی را برای ورود، رمز عبور، کیف پول یا دادهٔ خصوصی استفاده نکن؛ فقط برای GETهای عمومی و آزمایشی.</i>",
+        f'<a href="{html.escape(HTTP_PROXY_SOURCE, quote=True)}">منبع فهرست HTTP/HTTPS</a> | '
+        f'<a href="{html.escape(MTPROTO_SOURCE, quote=True)}">منبع MTProto</a>',
+    ])
+    return "\n".join(lines)
 
 
 @app.get("/health")
