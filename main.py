@@ -847,11 +847,11 @@ async def radar_vless_selftest(request: Request):
         host = get_host(request)
         address = b"example.com"
         header = (
-            b"\\x00" + bytes.fromhex(test_uid.replace("-", "")) +
-            b"\\x00\\x01" + (80).to_bytes(2, "big") +
-            b"\\x02" + bytes([len(address)]) + address
+            b"\x00" + bytes.fromhex(test_uid.replace("-", "")) +
+            b"\x00\x01" + (80).to_bytes(2, "big") +
+            b"\x02" + bytes([len(address)]) + address
         )
-        http_request = b"GET / HTTP/1.1\\r\\nHost: example.com\\r\\nConnection: close\\r\\n\\r\\n"
+        http_request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
         try:
             import websockets
             uri = f"wss://{host}/ws/{test_uid}"
@@ -859,7 +859,7 @@ async def radar_vless_selftest(request: Request):
                 await ws.send(header + http_request)
                 response = await asyncio.wait_for(ws.recv(), timeout=12)
             raw = response.encode() if isinstance(response, str) else bytes(response)
-            if raw.startswith(b"\\x00\\x00"):
+            if raw.startswith(b"\x00\x00"):
                 raw = raw[2:]
             preview = raw[:240].decode("utf-8", errors="replace")
             result = {
