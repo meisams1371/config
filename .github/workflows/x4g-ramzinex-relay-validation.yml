@@ -1,0 +1,224 @@
+name: X4G Ramzinex relay syntax and guardrail test
+
+on:
+  push:
+    branches:
+      - ramzinex-x4g-iran-egress
+
+permissions:
+  contents: read
+
+jobs:
+  validate-relay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned X4G dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Compile Python modules
+        run: python -m py_compile main.py relay_app.py
+      - name: Test relay guards without making network requests
+        env:
+          RAMZINEX_UPSTREAM_PROXY: http://127.0.0.1:8080
+          RAMZINEX_RELAY_TOKEN: test-only-not-a-real-secret-token-1234567890
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          import relay_app
+          import asyncio
+          import time
+
+          # ProxySpace candidate parsing is intentionally not an attestation:
+          # each endpoint must still pass live GeoIP, REST, and WebSocket checks.
+          proxyspace_rows = relay_app._proxyspace_candidates(
+              "185.129.213.210:8080",
+              "80.191.46.62:1099",
+          )
+          assert len(proxyspace_rows) == 2, proxyspace_rows
+          assert all(row["proxy"].startswith("http://") for row in proxyspace_rows)
+          assert proxyspace_rows[0]["anonymity"] == "proxyspace-http"
+          assert proxyspace_rows[-1]["anonymity"] == "proxyspace-https"
+
+          # Seed a local-only verified route so the ASGI bridge test performs no
+          # public network discovery and exercises the same dynamic route pool.
+          relay_app._ramzinex_proxy_urls = [relay_app.UPSTREAM_PROXY]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
+          relay_app._set_ramzinex_proxy_status("configured", 1)
+
+          client = TestClient(relay_app.app)
+
+          health = client.get("/health")
+          assert health.status_code == 200, health.text
+          assert health.json()["upstream_proxy_configured"] is True
+          assert health.json()["upstream_proxy_ready"] is True
+          assert health.json()["proxy_pool"]["verified_count"] == 1
+          assert health.json()["relay_token_configured"] is True
+          ready = client.get("/ready")
+          assert ready.status_code == 200, ready.text
+          assert ready.json()["verified_routes"] == 1
+
+          async def check_manager_lifecycle():
+              await relay_app.start_proxy_manager()
+              assert relay_app._ramzinex_proxy_task is not None
+              await relay_app.stop_proxy_manager()
+              assert relay_app._ramzinex_proxy_task is None
+
+          asyncio.run(check_manager_lifecycle())
+
+          # Verify a failed entry is removed while the next verified route stays available.
+          backup_route = "http://127.0.0.2:8081"
+          relay_app._ramzinex_proxy_urls = [relay_app.UPSTREAM_PROXY, backup_route]
+          asyncio.run(relay_app._mark_ramzinex_proxy_failed(relay_app.UPSTREAM_PROXY))
+          assert relay_app._ramzinex_proxy_urls == [backup_route]
+          relay_app._ramzinex_proxy_urls = [relay_app.UPSTREAM_PROXY]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
+          relay_app._set_ramzinex_proxy_status("configured", 1)
+
+          # Missing token must be rejected before any outbound request.
+          unauthorized = client.get("/ramzinex/pairs")
+          assert unauthorized.status_code == 401, unauthorized.text
+
+          headers = {"Authorization": "Bearer " + relay_app.TOKEN}
+
+          # Unlisted paths and arbitrary query parameters must be rejected.
+          denied_path = client.get("/ramzinex/anything/at/all", headers=headers)
+          assert denied_path.status_code == 404, denied_path.text
+
+          denied_query = client.get(
+              "/ramzinex/pairs?target=https://example.com",
+              headers=headers,
+          )
+          assert denied_query.status_code == 400, denied_query.text
+
+          # Verify the WebSocket bridge only forwards public, read-only Centrifuge commands.
+          assert relay_app._valid_ws_token(relay_app.TOKEN) is True
+          assert relay_app._valid_ws_token("wrong-test-token") is False
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"connect":{"name":"js"},"id":1}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"subscribe":{"channel":"orderbook:11","recover":true,"delta":"fossil"},"id":2}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"subscribe":{"channel":"last-trades:11","recover":true,"delta":"fossil"},"id":3}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame('{}')
+          # Both common unsubscribe forms are safe only for public subscriptions.
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"unsubscribe":{"channel":"orderbook:11"},"id":7}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"unsubscribe":{"sid":"7"},"id":8}'
+          )
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"unsubscribe":{"channel":"private:orders:11"},"id":9}'
+          )
+          # An unauthenticated browser WebSocket must be rejected before upstream access.
+          from starlette.websockets import WebSocketDisconnect
+          try:
+              with client.websocket_connect("/ws"):
+                  raise AssertionError("unauthenticated WebSocket was accepted")
+          except WebSocketDisconnect as exc:
+              assert exc.code == 1008, exc.code
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"subscribe":{"channel":"private:orders:11"},"id":4}'
+          )
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"publish":{"channel":"orderbook:11","data":{}},"id":5}'
+          )
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"connect":{"name":"js","token":"private-token"},"id":6}'
+          )
+
+          # Exercise the actual ASGI WebSocket bridge with a mocked upstream.
+          import asyncio
+          from unittest.mock import patch
+
+          fake_upstreams = []
+          attempted_proxy_urls = []
+          dead_route = "http://127.0.0.3:8080"
+          backup_route = "http://127.0.0.2:8081"
+
+          # The first candidate is dead; the bridge must move to the verified
+          # backup entry instead of failing the downstream connection.
+          relay_app._ramzinex_proxy_urls = [dead_route, backup_route]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
+
+          class FakeUpstream:
+              subprotocol = "centrifuge-json"
+
+              def __init__(self):
+                  self.sent = []
+                  self.queue = asyncio.Queue()
+
+              async def __aenter__(self):
+                  return self
+
+              async def __aexit__(self, exc_type, exc, tb):
+                  await self.queue.put(None)
+
+              async def send(self, message):
+                  self.sent.append(message)
+                  await self.queue.put(message)
+
+              def __aiter__(self):
+                  return self
+
+              async def __anext__(self):
+                  message = await self.queue.get()
+                  if message is None:
+                      raise StopAsyncIteration
+                  return message
+
+          def fake_connect(*args, **kwargs):
+              assert args[0] == relay_app.WS_ENDPOINT
+              assert kwargs.get("subprotocols") == ["centrifuge-json"]
+              proxy = kwargs.get("proxy")
+              attempted_proxy_urls.append(proxy)
+              if proxy == dead_route:
+                  raise OSError("simulated dead proxy route")
+              assert proxy == backup_route
+              upstream = FakeUpstream()
+              fake_upstreams.append(upstream)
+              return upstream
+
+          connect_frame = '{"connect":{"name":"js"},"id":1}'
+          subscribe_frame = '{"subscribe":{"channel":"orderbook:11","recover":true},"id":2}'
+          with patch.object(relay_app.websockets, "connect", side_effect=fake_connect):
+              with client.websocket_connect(
+                  "/ws", headers={"X-Relay-Token": relay_app.TOKEN}
+              ) as ws:
+                  ws.send_text(connect_frame)
+                  assert ws.receive_text() == connect_frame
+                  ws.send_text(subscribe_frame)
+                  assert ws.receive_text() == subscribe_frame
+
+          assert attempted_proxy_urls == [dead_route, backup_route], attempted_proxy_urls
+          assert len(fake_upstreams) == 1
+          assert fake_upstreams[0].sent == [connect_frame, subscribe_frame]
+          assert relay_app._ramzinex_proxy_urls == [backup_route]
+          assert relay_app._ws_active_total == 0
+
+          # Forbidden publish commands must close the tunnel without reaching upstream.
+          fake_upstreams.clear()
+          attempted_proxy_urls.clear()
+          relay_app._ramzinex_proxy_urls = [backup_route]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
+          with patch.object(relay_app.websockets, "connect", side_effect=fake_connect):
+              with client.websocket_connect(
+                  "/ws", headers={"X-Relay-Token": relay_app.TOKEN}
+              ) as ws:
+                  ws.send_text('{"publish":{"channel":"orderbook:11","data":{}},"id":3}')
+                  closed = ws.receive()
+                  assert closed["type"] in ("websocket.close", "websocket.disconnect"), closed
+                  assert closed.get("code") == 1008, closed
+          assert attempted_proxy_urls == [backup_route], attempted_proxy_urls
+          assert len(fake_upstreams) == 1
+          assert fake_upstreams[0].sent == []
+          assert relay_app._ws_active_total == 0
+
+          print("relay syntax, guardrail, failover, and bidirectional WebSocket tests passed")
+          PY

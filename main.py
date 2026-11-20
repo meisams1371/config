@@ -25,6 +25,14 @@ IRAN_TZ = ZoneInfo("Asia/Tehran")
 
 app = FastAPI(title="X4G", docs_url=None, redoc_url=None)
 
+# Isolated, read-only Ramzinex relay with a self-healing Iran egress pool.
+from relay_app import (
+    app as egress_probe_app,
+    start_proxy_manager as start_ramzinex_proxy_manager,
+    stop_proxy_manager as stop_ramzinex_proxy_manager,
+)
+app.mount("/egress", egress_probe_app)
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_FILE = DATA_DIR / "x4g_state.json"
@@ -160,7 +168,10 @@ SESSION_TTL = 60 * 60 * 24 * 365
 def hash_password(pw: str) -> str:
     return hashlib.sha256(f"{pw}{CONFIG['secret']}".encode()).hexdigest()
 
-AUTH = {"password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "X4GKING"))}
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+if len(ADMIN_PASSWORD) < 24:
+    raise RuntimeError("Set a strong ADMIN_PASSWORD (at least 24 characters) in Railway variables.")
+AUTH = {"password_hash": hash_password(ADMIN_PASSWORD)}
 SESSIONS: dict = {}
 SESSIONS_LOCK = asyncio.Lock()
 
@@ -204,12 +215,39 @@ async def startup():
         limits=limits, timeout=timeout, follow_redirects=True,
     )
     await load_state()
+    # Discover and maintain verified Iranian egress routes in the background.
+    # This does not block X4G startup; the relay reports unavailable until a route
+    # passes GeoIP and real Ramzinex public GET checks.
+    await start_ramzinex_proxy_manager()
+    # Create a disposable, limited VLESS test link only on this isolated test branch.
+    test_uid = os.environ.get("RADAR_VLESS_TEST_UUID", "").strip()
+    if test_uid:
+        async with LINKS_LOCK:
+            if test_uid not in LINKS:
+                LINKS[test_uid] = {
+                    "label": "Temporary VLESS transport test",
+                    "limit_bytes": 100 * 1024 * 1024,
+                    "used_bytes": 0,
+                    "created_at": datetime.now().isoformat(),
+                    "active": True,
+                    "expires_at": None,
+                    "note": "Temporary test link; not a production config",
+                    "is_default": False,
+                    "protocol": "vless-ws",
+                    "fingerprint": "chrome",
+                    "alpn": "http/1.1",
+                    "port": 443,
+                    "ip_limit": 1,
+                    "speed_limit_bytes": 0,
+                }
+        await save_state()
     await _tg_start_bot()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
     logger.info(f"X4G v9.8 started on port {CONFIG['port']}")
 
 @app.on_event("shutdown")
 async def shutdown():
+    await stop_ramzinex_proxy_manager()
     await save_state()
     await _tg_stop_bot()
     if http_client:
@@ -791,22 +829,67 @@ _HOP = {"connection","keep-alive","proxy-authenticate","proxy-authorization",
         "te","trailers","transfer-encoding","upgrade","content-encoding","content-length"}
 
 @app.api_route("/proxy/{target_url:path}", methods=["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"])
-async def http_proxy(target_url: str, request: Request):
-    if not target_url.startswith("http"):
-        target_url = "https://" + target_url
-    try:
-        body = await request.body()
-        headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP and k.lower() != "host"}
-        resp = await http_client.request(method=request.method, url=target_url, headers=headers, content=body)
-        stats["total_bytes"] += len(resp.content)
-        stats["total_requests"] += 1
-        hourly_traffic[now_ir().strftime("%H:00")] += len(resp.content)
-        return Response(content=resp.content, status_code=resp.status_code,
-                        headers={k: v for k, v in resp.headers.items() if k.lower() not in _HOP})
-    except Exception as exc:
-        stats["total_errors"] += 1
-        error_logs.append({"error": str(exc), "url": target_url, "time": datetime.now().isoformat()})
-        raise HTTPException(status_code=502, detail=f"Proxy error: {exc}")
+async def http_proxy_disabled(target_url: str, request: Request):
+    # The old generic URL proxy was unauthenticated and could be abused for SSRF.
+    # It is intentionally disabled in this secure test build.
+    raise HTTPException(status_code=410, detail="Generic URL proxy is disabled in this build.")
+
+
+# ── VLESS WebSocket loopback self-test (read-only, rate-limited) ──────────────
+_vless_selftest_cache = None
+_vless_selftest_at = 0.0
+_vless_selftest_lock = asyncio.Lock()
+
+@app.get("/radar/vless-selftest")
+async def radar_vless_selftest(request: Request):
+    global _vless_selftest_cache, _vless_selftest_at
+    now = time.monotonic()
+    if _vless_selftest_cache is not None and now - _vless_selftest_at < 30:
+        return {"cached": True, **_vless_selftest_cache}
+    async with _vless_selftest_lock:
+        now = time.monotonic()
+        if _vless_selftest_cache is not None and now - _vless_selftest_at < 30:
+            return {"cached": True, **_vless_selftest_cache}
+        test_uid = os.environ.get("RADAR_VLESS_TEST_UUID", "").strip()
+        if not test_uid:
+            raise HTTPException(status_code=503, detail="VLESS test UUID is not configured")
+        host = get_host(request)
+        address = b"example.com"
+        header = (
+            b"\x00" + bytes.fromhex(test_uid.replace("-", "")) +
+            b"\x00\x01" + (80).to_bytes(2, "big") +
+            b"\x02" + bytes([len(address)]) + address
+        )
+        http_request = b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"
+        try:
+            import websockets
+            uri = f"wss://{host}/ws/{test_uid}"
+            async with websockets.connect(uri, open_timeout=12, close_timeout=2, max_size=1024 * 1024) as ws:
+                await ws.send(header + http_request)
+                response = await asyncio.wait_for(ws.recv(), timeout=12)
+            raw = response.encode() if isinstance(response, str) else bytes(response)
+            if raw.startswith(b"\x00\x00"):
+                raw = raw[2:]
+            preview = raw[:240].decode("utf-8", errors="replace")
+            result = {
+                "ok": b"HTTP/" in raw[:40],
+                "transport": "VLESS over WebSocket + TLS",
+                "destination": "example.com:80",
+                "response_preview": preview,
+                "checked_at": datetime.now().isoformat(),
+            }
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "transport": "VLESS over WebSocket + TLS",
+                "destination": "example.com:80",
+                "error": type(exc).__name__,
+                "detail": str(exc)[:180],
+                "checked_at": datetime.now().isoformat(),
+            }
+        _vless_selftest_cache = result
+        _vless_selftest_at = time.monotonic()
+        return {"cached": False, **result}
 
 # ── Public sub page (یک صفحه‌ی زیبا و مستقل به‌ازای هر کانفیگ) ────────────────
 @app.get("/p/{uuid_key}", response_class=HTMLResponse)

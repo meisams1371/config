@@ -1,0 +1,99 @@
+name: Validate daily Iran proxy discovery
+
+on:
+  push:
+    branches:
+      - ramzinex-x4g-iran-egress
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install project dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Compile application modules
+        run: python -m py_compile main.py relay_app.py telegram_bot.py
+      - name: Check proxy discovery guardrails
+        run: |
+          python - <<'PY'
+          import relay_app
+          assert relay_app._allowed_path("pairs/2")
+          assert relay_app._allowed_path("orderbooks/2/buys_sells")
+          assert not relay_app._allowed_path("https://example.com")
+          assert not relay_app._allowed_path("../admin")
+          assert callable(relay_app.scan_iran_proxies)
+          assert callable(relay_app.build_daily_proxy_report)
+          print("syntax and guardrail tests passed")
+          PY
+      - name: Test Telegram report imports and bounded VLESS candidates
+        env:
+          ADMIN_PASSWORD: "ci-only-password-not-for-production-123456"
+          SECRET_KEY: "ci-only-secret-not-for-production-123456789"
+        run: |
+          python - <<'PY'
+          import main
+          import relay_app
+          import telegram_bot
+
+          sample = "\n".join([
+              "vless://12345678-1234-1234-1234-123456789abc@example.ir:443?type=ws&security=tls#test",
+              "vless://12345678-1234-1234-1234-123456789abd@example2.ir:443?type=tcp&security=reality#test2",
+              "vless://12345678-1234-1234-1234-123456789abe@example3.ir:443?type=ws&security=tls#test3",
+              "vless://12345678-1234-1234-1234-123456789abf@example4.ir:443?type=ws&security=tls&extra={",
+          ])
+          generated, candidates = relay_app._parse_public_vless(sample)
+          assert len(candidates) == 2, len(candidates)
+          assert all(row["connection_verified"] is False for row in candidates)
+          assert telegram_bot.REPORT_TZ_NAME == "Asia/Baku"
+          assert telegram_bot.REPORT_HOUR == 9
+          assert callable(relay_app.build_daily_proxy_report)
+          print("Telegram report import and bounded VLESS candidate tests passed")
+          PY
+      - name: Run live read-only Iran proxy discovery
+        run: |
+          python - <<'PY'
+          import asyncio, json, relay_app
+          async def main():
+              report = await relay_app.scan_iran_proxies(force=True)
+              safe = {
+                  "checked_at": report.get("checked_at"),
+                  "http_candidates": report.get("http_candidates"),
+                  "http_tested": report.get("http_tested"),
+                  "http_diagnostics": report.get("http_diagnostics"),
+                  "iran_http_exits": [
+                      {
+                          "proxy": row.get("proxy"),
+                          "exit_ip": row.get("exit_ip"),
+                          "city": row.get("geoip", {}).get("city"),
+                          "geoip_votes": {k:v.get("country") for k,v in row.get("geoip", {}).get("votes", {}).items()},
+                          "ramzinex_ready": row.get("ramzinex_ready"),
+                          "pairs_status": row.get("pairs_status"),
+                          "orderbook_status": row.get("orderbook_status"),
+                          "latency_ms": row.get("latency_ms"),
+                      }
+                      for row in report.get("iran_http_exits", [])
+                  ],
+                  "ramzinex_ready_count": len(report.get("ramzinex_ready", [])),
+                  "mtproto_iran_tcp": [
+                      {
+                          "host": row.get("host"),
+                          "port": row.get("port"),
+                          "ip": row.get("ip"),
+                          "city": row.get("city"),
+                          "tcp_ms": row.get("tcp_ms"),
+                          "telegram_handshake_verified": False,
+                      }
+                      for row in report.get("mtproto_iran_tcp", [])
+                  ],
+              }
+              print(json.dumps(safe, ensure_ascii=False, indent=2))
+          asyncio.run(main())
+          PY

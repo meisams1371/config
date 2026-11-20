@@ -1,0 +1,82 @@
+name: Ramzinex official Centrifuge WebSocket probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ramzinex-x4g-iran-egress
+    paths:
+      - "scripts/ramzinex-centrifuge-probe.mjs"
+      - "scripts/ramzinex-relay-live-smoke.py"
+      - "ramzinex_relay_smoke_server.py"
+      - ".github/workflows/ramzinex-centrifuge-ws-probe.yml"
+      - "relay_app.py"
+      - "requirements.txt"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install scanner dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Find Iranian egress routes that pass GeoIP, Ramzinex REST and Centrifuge WebSocket checks
+        run: |
+          python - <<'PY'
+          import asyncio, json, os
+          import relay_app
+
+          async def main():
+              report = await relay_app.refresh_ramzinex_proxy_pool(force=True)
+              valid = list(relay_app._ramzinex_proxy_urls)
+              for proxy in valid:
+                  print("::add-mask::" + proxy)
+              if valid:
+                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+                      env.write("RAMZINEX_WS_HTTP_PROXIES=" + ",".join(valid) + "\n")
+
+              safe_report = {
+                  "checked_at": report.get("checked_at"),
+                  "pool_state": report.get("state"),
+                  "candidate_count": report.get("candidate_count", 0),
+                  "http_ready_count": report.get("http_ready_count", 0),
+                  "websocket_tested_count": report.get("websocket_tested_count", 0),
+                  "websocket_ready_count": report.get("websocket_ready_count", 0),
+                  "verified_route_count": len(valid),
+                  "refresh_seconds": report.get("refresh_seconds", relay_app._RAMZINEX_PROXY_REFRESH_SECONDS),
+                  "proxy_values_written_to_github_env": bool(valid),
+                  "warning": "A route is admitted only after two-of-three Iran GeoIP votes, Ramzinex pairs/orderbook HTTP 200, Centrifuge connect/subscribe ACK, and a live orderbook publication. Proxy URLs are masked and never printed.",
+              }
+              print(json.dumps(safe_report, ensure_ascii=False, indent=2))
+          asyncio.run(main())
+          PY
+      # The relay smoke test must run even when the independent Node diagnostic fails.
+      # Both tests use the same currently verified route, but separate WebSocket clients.
+      - name: Run live read-only WebSocket smoke test through the Python relay
+        if: env.RAMZINEX_WS_HTTP_PROXIES != ''
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python scripts/ramzinex-relay-live-smoke.py
+      - name: Report that live relay smoke test was not runnable
+        if: env.RAMZINEX_WS_HTTP_PROXIES == ''
+        run: echo "::notice::No currently verified Iran/Ramzinex proxy route was discovered; live relay smoke test was skipped without direct fallback."
+      - uses: actions/setup-node@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          node-version: "22"
+      - name: Install official Centrifuge SDK and WebSocket proxy transport
+        if: github.event_name == 'workflow_dispatch'
+        run: npm install --no-save --no-package-lock centrifuge@5.3.4 ws@8.18.3 https-proxy-agent@7.0.6
+      - name: Connect, subscribe, and observe public market channels (diagnostic)
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        env:
+          RAMZINEX_WS_HTTP_PROXY: ${{ secrets.RAMZINEX_WS_HTTP_PROXY }}
+        run: node scripts/ramzinex-centrifuge-probe.mjs
