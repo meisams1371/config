@@ -28,13 +28,31 @@ jobs:
           python - <<'PY'
           from fastapi.testclient import TestClient
           import relay_app
+          import time
+
+          # Seed a local-only verified route so the ASGI bridge test performs no
+          # public network discovery and exercises the same dynamic route pool.
+          relay_app._ramzinex_proxy_urls = [relay_app.UPSTREAM_PROXY]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
+          relay_app._set_ramzinex_proxy_status("configured", 1)
 
           client = TestClient(relay_app.app)
 
           health = client.get("/health")
           assert health.status_code == 200, health.text
           assert health.json()["upstream_proxy_configured"] is True
+          assert health.json()["upstream_proxy_ready"] is True
+          assert health.json()["proxy_pool"]["verified_count"] == 1
           assert health.json()["relay_token_configured"] is True
+
+          # Verify a failed entry is removed while the next verified route stays available.
+          backup_route = "http://127.0.0.2:8081"
+          relay_app._ramzinex_proxy_urls = [relay_app.UPSTREAM_PROXY, backup_route]
+          asyncio.run(relay_app._mark_ramzinex_proxy_failed(relay_app.UPSTREAM_PROXY))
+          assert relay_app._ramzinex_proxy_urls == [backup_route]
+          relay_app._ramzinex_proxy_urls = [relay_app.UPSTREAM_PROXY]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
+          relay_app._set_ramzinex_proxy_status("configured", 1)
 
           # Missing token must be rejected before any outbound request.
           unauthorized = client.get("/ramzinex/pairs")
