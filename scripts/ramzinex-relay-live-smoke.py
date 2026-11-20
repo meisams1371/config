@@ -148,7 +148,7 @@ def main() -> None:
     server_log = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
     server = subprocess.Popen(
         [
-            sys.executable, "-m", "uvicorn", "relay_app:app",
+            sys.executable, "-m", "uvicorn", "ramzinex_relay_smoke_server:app",
             "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning",
         ],
         env=env,
@@ -166,16 +166,28 @@ def main() -> None:
                 return {}
 
         ready = False
-        for _ in range(80):
+        last_health = {}
+        # The CI test server waits for the exact same startup route scan as production.
+        # Allow up to 120s for slow public-proxy sources and GeoIP checks.
+        for _ in range(480):
             if server.poll() is not None:
                 raise RuntimeError("Local relay process exited before becoming healthy")
-            health = read_health()
-            ready = bool(health.get("ok") is True and health.get("relay_token_configured") is True)
+            last_health = read_health()
+            pool = last_health.get("proxy_pool") or {}
+            ready = (
+                last_health.get("ok") is True
+                and last_health.get("relay_token_configured") is True
+                and last_health.get("upstream_proxy_ready") is True
+                and pool.get("verified_count", 0) > 0
+            )
             if ready:
                 break
             time.sleep(0.25)
         if not ready:
-            raise TimeoutError("Local Ramzinex relay did not become healthy")
+            raise TimeoutError(
+                "Local Ramzinex relay did not find a WebSocket-ready route: "
+                + json.dumps(last_health.get("proxy_pool") or {}, ensure_ascii=False)
+            )
 
         try:
             result = asyncio.run(run_smoke(f"ws://127.0.0.1:{port}/ws"))
