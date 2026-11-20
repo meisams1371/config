@@ -1007,6 +1007,7 @@ async def _mark_ramzinex_proxy_failed(proxy_url: str) -> None:
 
 async def _ramzinex_proxy_maintenance_loop() -> None:
     while True:
+        await asyncio.sleep(_RAMZINEX_PROXY_REFRESH_SECONDS)
         try:
             await refresh_ramzinex_proxy_pool(force=True)
         except asyncio.CancelledError:
@@ -1014,13 +1015,37 @@ async def _ramzinex_proxy_maintenance_loop() -> None:
         except Exception as exc:
             logger.warning("Ramzinex proxy maintenance failed type=%s", type(exc).__name__)
             _set_ramzinex_proxy_status("unavailable", len(_ramzinex_proxy_urls), type(exc).__name__)
-        await asyncio.sleep(_RAMZINEX_PROXY_REFRESH_SECONDS)
 
 
 async def start_proxy_manager() -> None:
-    """Start periodic route discovery from the parent X4G FastAPI lifecycle."""
+    """Warm the verified route pool, then keep it refreshed for the app lifetime."""
     global _ramzinex_proxy_task
     if _ramzinex_proxy_task is None or _ramzinex_proxy_task.done():
+        # Complete one bounded initial scan before the application is marked ready.
+        # This prevents the first WebSocket handshake from waiting behind a 30-60s scan.
+        startup_timeout = max(
+            20, min(120, int(os.environ.get("RAMZINEX_PROXY_STARTUP_TIMEOUT", "90")))
+        )
+        try:
+            await asyncio.wait_for(
+                refresh_ramzinex_proxy_pool(force=False),
+                timeout=startup_timeout,
+            )
+        except asyncio.TimeoutError:
+            _set_ramzinex_proxy_status(
+                "starting",
+                len(_ramzinex_proxy_urls),
+                "initial_proxy_scan_timeout",
+            )
+            logger.warning("Ramzinex initial proxy scan exceeded %s seconds", startup_timeout)
+        except Exception as exc:
+            _set_ramzinex_proxy_status(
+                "unavailable",
+                len(_ramzinex_proxy_urls),
+                type(exc).__name__,
+            )
+            logger.warning("Ramzinex initial proxy scan failed type=%s", type(exc).__name__)
+
         _ramzinex_proxy_task = asyncio.create_task(
             _ramzinex_proxy_maintenance_loop(),
             name="ramzinex-proxy-maintenance",
@@ -1145,6 +1170,19 @@ async def build_daily_proxy_report(force: bool = False) -> str:
         f'<a href="{html.escape(MTPROTO_SOURCE, quote=True)}">منبع MTProto</a>',
     ])
     return "\n".join(lines)
+
+
+@app.get("/ready")
+async def ready() -> JSONResponse:
+    """Readiness check for monitoring; 503 until a usable WebSocket route exists."""
+    healthy = bool(TOKEN and len(TOKEN) >= 32 and _ramzinex_proxy_urls)
+    payload = {
+        "ready": healthy,
+        "relay_token_configured": len(TOKEN) >= 32,
+        "proxy_pool_state": _ramzinex_proxy_status.get("state"),
+        "verified_routes": len(_ramzinex_proxy_urls),
+    }
+    return JSONResponse(payload, status_code=200 if healthy else 503)
 
 
 @app.get("/health")
@@ -1374,6 +1412,22 @@ async def ramzinex_public_websocket(websocket: WebSocket):
 
         if websocket.application_state != WebSocketState.CONNECTED:
             await websocket.close(code=1013, reason="no verified Ramzinex egress route")
+    except Exception as exc:
+        logger.warning(
+            "Ramzinex WebSocket setup failed type=%s pool_state=%s",
+            type(exc).__name__,
+            _ramzinex_proxy_status.get("state"),
+        )
+        if websocket.application_state != WebSocketState.CONNECTED:
+            try:
+                await websocket.close(code=1013, reason="Ramzinex route discovery failed")
+            except Exception:
+                pass
+        elif websocket.client_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.close(code=1011, reason="upstream unavailable; reconnect")
+            except Exception:
+                pass
     finally:
         await _ws_connection_release(client_ip)
 
