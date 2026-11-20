@@ -116,6 +116,14 @@ jobs:
           from unittest.mock import patch
 
           fake_upstreams = []
+          attempted_proxy_urls = []
+          dead_route = "http://127.0.0.3:8080"
+          backup_route = "http://127.0.0.2:8081"
+
+          # The first candidate is dead; the bridge must move to the verified
+          # backup entry instead of failing the downstream connection.
+          relay_app._ramzinex_proxy_urls = [dead_route, backup_route]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
 
           class FakeUpstream:
               subprotocol = "centrifuge-json"
@@ -146,7 +154,11 @@ jobs:
           def fake_connect(*args, **kwargs):
               assert args[0] == relay_app.WS_ENDPOINT
               assert kwargs.get("subprotocols") == ["centrifuge-json"]
-              assert kwargs.get("proxy") == relay_app.UPSTREAM_PROXY
+              proxy = kwargs.get("proxy")
+              attempted_proxy_urls.append(proxy)
+              if proxy == dead_route:
+                  raise OSError("simulated dead proxy route")
+              assert proxy == backup_route
               upstream = FakeUpstream()
               fake_upstreams.append(upstream)
               return upstream
@@ -162,12 +174,17 @@ jobs:
                   ws.send_text(subscribe_frame)
                   assert ws.receive_text() == subscribe_frame
 
+          assert attempted_proxy_urls == [dead_route, backup_route], attempted_proxy_urls
           assert len(fake_upstreams) == 1
           assert fake_upstreams[0].sent == [connect_frame, subscribe_frame]
+          assert relay_app._ramzinex_proxy_urls == [backup_route]
           assert relay_app._ws_active_total == 0
 
           # Forbidden publish commands must close the tunnel without reaching upstream.
           fake_upstreams.clear()
+          attempted_proxy_urls.clear()
+          relay_app._ramzinex_proxy_urls = [backup_route]
+          relay_app._ramzinex_proxy_checked_at = time.monotonic()
           with patch.object(relay_app.websockets, "connect", side_effect=fake_connect):
               with client.websocket_connect(
                   "/ws", headers={"X-Relay-Token": relay_app.TOKEN}
@@ -176,9 +193,10 @@ jobs:
                   closed = ws.receive()
                   assert closed["type"] in ("websocket.close", "websocket.disconnect"), closed
                   assert closed.get("code") == 1008, closed
+          assert attempted_proxy_urls == [backup_route], attempted_proxy_urls
           assert len(fake_upstreams) == 1
           assert fake_upstreams[0].sent == []
           assert relay_app._ws_active_total == 0
 
-          print("relay syntax, guardrail, and bidirectional WebSocket tests passed")
+          print("relay syntax, guardrail, failover, and bidirectional WebSocket tests passed")
           PY
