@@ -571,7 +571,39 @@ async def _test_ramzinex_websocket_proxy(proxy_url: str) -> bool:
             if not await receive_matching(2, "subscribe", 8):
                 return False
 
-            return True
+            # An ACK alone can still be a half-working path. Require one real,
+            # structurally valid public orderbook publication before admitting it.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                raw = await asyncio.wait_for(
+                    ws.recv(),
+                    timeout=max(0.1, deadline - time.monotonic()),
+                )
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                for line in str(raw).splitlines() or [str(raw)]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        frame = json.loads(line)
+                    except Exception:
+                        continue
+                    if frame == {}:
+                        await ws.send("{}")
+                        continue
+                    push = frame.get("push") if isinstance(frame, dict) else None
+                    if not isinstance(push, dict) or push.get("channel") != "orderbook:2":
+                        continue
+                    publication = push.get("pub")
+                    data = publication.get("data") if isinstance(publication, dict) else None
+                    if (
+                        isinstance(data, dict)
+                        and isinstance(data.get("buys"), list)
+                        and isinstance(data.get("sells"), list)
+                    ):
+                        return True
+            return False
     except Exception:
         return False
 
