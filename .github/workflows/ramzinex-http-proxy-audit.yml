@@ -1,0 +1,97 @@
+name: Ramzinex Iran HTTP proxy egress audit
+
+on:
+  push:
+    branches:
+      - ramzinex-egress-audit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ramzinex-http-proxy-audit
+  cancel-in-progress: true
+
+jobs:
+  test-http-proxies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install requests
+        run: python -m pip install --disable-pip-version-check requests
+      - name: Test Iran HTTP and HTTPS proxy candidates
+        run: |
+          python - <<'PY'
+          import concurrent.futures, json, time
+          from pathlib import Path
+          import requests
+
+          # Public endpoints from Proxifly's Iran list, retrieved 2026-11-20.
+          # No credentials or private data are sent; only public GET requests.
+          CANDIDATES = [
+            ("https://46.224.17.220:8443", "Proxifly HTTPS; Iran; transparent"),
+            ("https://151.242.183.28:443", "Proxifly HTTPS; Tehran; transparent"),
+            ("https://94.183.162.84:443", "Proxifly HTTPS; Iran; transparent"),
+            ("http://91.98.78.64:80", "Proxifly HTTP; Iran; elite"),
+            ("http://2.179.95.57:8080", "Proxifly HTTP; Arak; transparent"),
+            ("http://213.207.195.178:8080", "Proxifly HTTP; Tehran; transparent"),
+            ("http://37.32.26.209:10809", "Proxifly HTTP; Iran; transparent"),
+            ("http://178.252.165.122:8080", "Proxifly HTTP; Iran; transparent"),
+          ]
+          TARGETS = {
+            "geo_ipapi": "https://ipapi.co/json/",
+            "geo_ip_api": "http://ip-api.com/json/?fields=status,countryCode,query,isp,as",
+            "ramzinex_pairs": "https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/pairs",
+            "ramzinex_prices": "https://publicapi.ramzinex.com/exchange/api/exchange/prices",
+            "ramzinex_orderbook_2": "https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/orderbooks/2/buys_sells",
+          }
+
+          def one(item):
+            proxy, source = item
+            s = requests.Session()
+            s.trust_env = False
+            s.proxies.update({"http": proxy, "https": proxy})
+            s.headers.update({"User-Agent":"RamzinexPublicReadOnlyConnectivityCheck/1.0","Accept":"application/json,*/*"})
+            result={"proxy":proxy,"source":source,"checks":{}}
+            for name,url in TARGETS.items():
+              try:
+                t=time.monotonic()
+                r=s.get(url,timeout=(5,8),allow_redirects=False)
+                entry={"status":r.status_code,"ms":round((time.monotonic()-t)*1000)}
+                if name=="geo_ipapi" and r.status_code==200:
+                  d=r.json();entry.update({"ip":d.get("ip"),"country":d.get("country_code") or d.get("country"),"city":d.get("city")})
+                elif name=="geo_ip_api" and r.status_code==200:
+                  d=r.json();entry.update({"ip":d.get("query"),"country":d.get("countryCode"),"isp":d.get("isp"),"as":d.get("as")})
+                elif name.startswith("ramzinex_") and r.status_code==200:
+                  try:
+                    d=r.json();entry["json"]=isinstance(d,(dict,list))
+                    if isinstance(d,dict):entry["keys"]=list(d.keys())[:8]
+                  except Exception:entry["json"]=False
+                result["checks"][name]=entry
+              except Exception as e:
+                result["checks"][name]={"error":type(e).__name__,"detail":str(e)[:160]}
+            countries=[v.get("country") for k,v in result["checks"].items() if k.startswith("geo_") and v.get("country")]
+            result["iran_exit_confirmed"]=bool(countries) and all(x=="IR" for x in countries)
+            result["ramzinex_gets_200"]=all(result["checks"].get(k,{}).get("status")==200 for k in ("ramzinex_pairs","ramzinex_prices","ramzinex_orderbook_2"))
+            s.close()
+            return result
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results=list(pool.map(one,CANDIDATES))
+          print(json.dumps(results,ensure_ascii=False,indent=2))
+          passed=[x for x in results if x["iran_exit_confirmed"] and x["ramzinex_gets_200"]]
+          print(f"\nSUMMARY: {len(passed)}/{len(results)} HTTP/HTTPS proxies passed Iran GeoIP + all three Ramzinex GET checks.")
+          Path("ramzinex-http-proxy-results.json").write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding="utf-8")
+          PY
+      - name: Upload HTTP proxy audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramzinex-http-proxy-read-only-audit
+          path: ramzinex-http-proxy-results.json
+          if-no-files-found: ignore
+          retention-days: 3
