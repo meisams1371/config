@@ -250,7 +250,7 @@ _scan_lock = asyncio.Lock()
 _SCAN_TTL_SECONDS = 1800
 _HTTP_SCAN_LIMIT = max(8, min(36, int(os.environ.get("IRAN_PROXY_SCAN_LIMIT", "24"))))
 _MTPROTO_SCAN_LIMIT = max(8, min(36, int(os.environ.get("IRAN_MTPROTO_SCAN_LIMIT", "20"))))
-_DIRECT_TIMEOUT = httpx.Timeout(connect=4.0, read=6.0, write=4.0, pool=3.0)
+_DIRECT_TIMEOUT = httpx.Timeout(connect=6.0, read=8.0, write=6.0, pool=4.0)
 
 
 def _public_ip(value: str) -> bool:
@@ -406,12 +406,29 @@ async def _test_http_proxy(candidate: dict, direct_client: httpx.AsyncClient) ->
                     "latency_ms": round((time.monotonic() - started) * 1000),
                 }
 
+            async def get_with_retry(url: str):
+                last_error = None
+                for attempt in range(3):
+                    try:
+                        response = await proxy_client.get(url)
+                        return response, None
+                    except httpx.RequestError as exc:
+                        last_error = exc
+                        if attempt < 2:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                return None, last_error
+
             pair_started = time.monotonic()
-            pairs = await proxy_client.get(RAMZINEX_PAIRS_URL)
+            pairs, pairs_error = await get_with_retry(RAMZINEX_PAIRS_URL)
             pair_ms = round((time.monotonic() - pair_started) * 1000)
+            if pairs is None:
+                raise pairs_error or httpx.ConnectError("pairs request failed")
+
             book_started = time.monotonic()
-            book = await proxy_client.get(RAMZINEX_ORDERBOOK_URL)
+            book, book_error = await get_with_retry(RAMZINEX_ORDERBOOK_URL)
             book_ms = round((time.monotonic() - book_started) * 1000)
+            if book is None:
+                raise book_error or httpx.ConnectError("orderbook request failed")
 
             pair_json = False
             book_json = False
