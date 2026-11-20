@@ -132,9 +132,13 @@ jobs:
       # The relay smoke test must run even when the independent Node diagnostic fails.
       # Both tests use the same currently verified route, but separate WebSocket clients.
       - name: Run live read-only WebSocket smoke test through the Python relay
+        if: env.RAMZINEX_WS_HTTP_PROXIES != ''
         env:
           PYTHONUNBUFFERED: "1"
         run: python scripts/ramzinex-relay-live-smoke.py
+      - name: Report that live relay smoke test was not runnable
+        if: env.RAMZINEX_WS_HTTP_PROXIES == ''
+        run: echo "::notice::No currently verified Iran/Ramzinex proxy route was discovered; live relay smoke test was skipped without direct fallback."
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
