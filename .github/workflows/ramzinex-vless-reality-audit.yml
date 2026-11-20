@@ -1,0 +1,214 @@
+name: Ramzinex VLESS Reality egress audit
+
+on:
+  push:
+    branches:
+      - ramzinex-egress-audit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ramzinex-vless-egress-audit
+  cancel-in-progress: true
+
+jobs:
+  test-vless-reality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Xray and HTTP client
+        run: |
+          set -euo pipefail
+          curl -fsSL -o xray.zip https://github.com/XTLS/Xray-core/releases/download/v26.11.9/Xray-linux-64.zip
+          mkdir -p "$RUNNER_TEMP/xray"
+          unzip -q xray.zip -d "$RUNNER_TEMP/xray"
+          chmod +x "$RUNNER_TEMP/xray/xray"
+          "$RUNNER_TEMP/xray/xray" version
+          python -m pip install --disable-pip-version-check "requests[socks]"
+      - name: Test public VLESS Reality candidates
+        run: |
+          python - <<'PY'
+          import concurrent.futures
+          import json
+          import os
+          import subprocess
+          import tempfile
+          import time
+          from pathlib import Path
+          import requests
+
+          XRAY = str(Path(os.environ["RUNNER_TEMP"]) / "xray" / "xray")
+
+          # These entries are copied from the public IR-exit + VLESS Reality
+          # list published 2026-11-20. Only public, unauthenticated GET probes
+          # are performed after the tunnel starts.
+          CANDIDATES = [
+            {
+              "name": "IR-REALITY-A",
+              "address": "94.182.134.170", "port": 8443,
+              "id": "7fd87f36-d0f6-40bb-9c5c-6c7b1148be03",
+              "pbk": "x2gVFOvPV4ucfzXqD7f_WkV_hw8rTHTPLCMgcgJgq0I",
+              "sni": "google.com", "sid": "0fb9f155", "fp": "chrome",
+              "flow": ""
+            },
+            {
+              "name": "IR-REALITY-B",
+              "address": "94.183.234.245", "port": 443,
+              "id": "5de0c218-0138-45d8-94d2-c2c3f37a1a6d",
+              "pbk": "tfFzmbVByvoZxxIEUiHMv22_k0-nQz00L0XjU0bd_Fc",
+              "sni": "www.bing.com", "sid": "7f1e29593aa94ad1", "fp": "chrome",
+              "flow": "xtls-rprx-vision"
+            },
+            {
+              "name": "IR-REALITY-C",
+              "address": "mabix.dgtr.net", "port": 443,
+              "id": "01d31e8f-5eb5-4f2f-bceb-addb87f107a3",
+              "pbk": "hvgEwCWp__pO1IzyQfvz-whyQhBbj760XxZ6SxD9qDg",
+              "sni": "speedtest.net", "sid": "b101b6832ecf3eca", "fp": "chrome",
+              "flow": "xtls-rprx-vision"
+            },
+            {
+              "name": "IR-REALITY-D",
+              "address": "tun404.app9.ir", "port": 8023,
+              "id": "27f1eba3-0d5f-47c3-8dfa-f734f3aeccdf",
+              "pbk": "3VKs9HG9EgsB69ppfvFEJcXiO5MDOvvQOByDD2HceXQ",
+              "sni": "speedtest.net", "sid": "b7e45d3a65bfc319", "fp": "chrome",
+              "flow": ""
+            },
+            {
+              "name": "IR-REALITY-E",
+              "address": "5.180.181.113", "port": 443,
+              "id": "b1da2601-ff93-46d6-af87-04af3f541fde",
+              "pbk": "wY_MYPJUx849su3BlowuxnwnUaj25iLfRw2LooQfPAY",
+              "sni": "sun1-19.userapi.com", "sid": "", "fp": "chrome",
+              "flow": "xtls-rprx-vision"
+            },
+          ]
+
+          TARGETS = {
+            "geo_ipapi": "https://ipapi.co/json/",
+            "geo_ip_api": "http://ip-api.com/json/?fields=status,countryCode,query,isp,as",
+            "ramzinex_pairs": "https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/pairs",
+            "ramzinex_prices": "https://publicapi.ramzinex.com/exchange/api/exchange/prices",
+            "ramzinex_orderbook_2": "https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/orderbooks/2/buys_sells",
+          }
+
+          def make_config(c, local_port, path):
+            user = {"id": c["id"], "encryption": "none"}
+            if c.get("flow"):
+              user["flow"] = c["flow"]
+            cfg = {
+              "log": {"loglevel": "warning"},
+              "inbounds": [{
+                "listen": "127.0.0.1", "port": local_port,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": False}
+              }],
+              "outbounds": [{
+                "protocol": "vless",
+                "settings": {"vnext": [{
+                  "address": c["address"], "port": c["port"], "users": [user]
+                }]},
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                    "serverName": c["sni"],
+                    "fingerprint": c["fp"],
+                    "publicKey": c["pbk"],
+                    "shortId": c["sid"],
+                    "spiderX": "/"
+                  }
+                }
+              }, {"protocol": "freedom", "tag": "direct"}],
+              "routing": {"domainStrategy": "AsIs"}
+            }
+            Path(path).write_text(json.dumps(cfg), encoding="utf-8")
+
+          def test_one(idx, c):
+            local_port = 10880 + idx
+            with tempfile.TemporaryDirectory() as td:
+              cfg_path = str(Path(td) / "xray.json")
+              make_config(c, local_port, cfg_path)
+              proc = subprocess.Popen(
+                [XRAY, "run", "-c", cfg_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+              )
+              result = {"name": c["name"], "endpoint": f'{c["address"]}:{c["port"]}', "checks": {}}
+              try:
+                ready = False
+                for _ in range(12):
+                  if proc.poll() is not None:
+                    result["xray_start_error"] = (proc.stderr.read() or "")[:500]
+                    return result
+                  try:
+                    s = requests.Session()
+                    s.trust_env = False
+                    s.proxies.update({
+                      "http": f"socks5h://127.0.0.1:{local_port}",
+                      "https": f"socks5h://127.0.0.1:{local_port}"
+                    })
+                    s.get("https://www.google.com/generate_204", timeout=(2, 2))
+                    ready = True
+                    break
+                  except Exception:
+                    time.sleep(1)
+                # The probe below is decisive. Google is used only to ensure
+                # the local Xray SOCKS inbound is responding; the return code
+                # itself is not treated as a pass/fail for Iran egress.
+                if not ready:
+                  result["local_socks_ready"] = False
+                  result["xray_log"] = (proc.stderr.read() or "")[:500] if proc.poll() is not None else "local SOCKS did not answer"
+                  return result
+                result["local_socks_ready"] = True
+                for label, url in TARGETS.items():
+                  try:
+                    t0 = time.monotonic()
+                    response = s.get(url, timeout=(4, 7), allow_redirects=False)
+                    entry = {"status": response.status_code, "ms": round((time.monotonic()-t0)*1000)}
+                    if label == "geo_ipapi" and response.status_code == 200:
+                      data = response.json()
+                      entry.update({"ip": data.get("ip"), "country": data.get("country_code") or data.get("country"), "city": data.get("city")})
+                    elif label == "geo_ip_api" and response.status_code == 200:
+                      data = response.json()
+                      entry.update({"ip": data.get("query"), "country": data.get("countryCode"), "isp": data.get("isp"), "as": data.get("as")})
+                    elif label.startswith("ramzinex_") and response.status_code == 200:
+                      try:
+                        data = response.json()
+                        entry["json"] = isinstance(data, (dict, list))
+                        if isinstance(data, dict):
+                          entry["keys"] = list(data.keys())[:8]
+                      except Exception:
+                        entry["json"] = False
+                    result["checks"][label] = entry
+                  except Exception as exc:
+                    result["checks"][label] = {"error": type(exc).__name__}
+                countries = [v.get("country") for k,v in result["checks"].items() if k.startswith("geo_") and v.get("country")]
+                result["iran_exit_confirmed"] = bool(countries) and all(x == "IR" for x in countries)
+                result["ramzinex_gets_200"] = all(result["checks"].get(k,{}).get("status")==200 for k in ("ramzinex_pairs","ramzinex_prices","ramzinex_orderbook_2"))
+                return result
+              finally:
+                try:
+                  proc.terminate()
+                  proc.wait(timeout=2)
+                except Exception:
+                  proc.kill()
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(lambda x: test_one(*x), enumerate(CANDIDATES)))
+
+          print(json.dumps(results, ensure_ascii=False, indent=2))
+          passed = [x for x in results if x.get("iran_exit_confirmed") and x.get("ramzinex_gets_200")]
+          print(f"\nSUMMARY: {len(passed)}/{len(results)} VLESS Reality configs passed Iran GeoIP + all three Ramzinex GET checks.")
+          Path("ramzinex-vless-results.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+      - name: Upload VLESS audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramzinex-vless-reality-read-only-audit
+          path: ramzinex-vless-results.json
+          if-no-files-found: ignore
+          retention-days: 3
