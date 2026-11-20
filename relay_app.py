@@ -242,6 +242,9 @@ HTTP_PROXY_SOURCE = (
 MTPROTO_SOURCE = (
     "https://raw.githubusercontent.com/Kolandone/v2raycollector/main/proxy.txt"
 )
+VLESS_SOURCE = (
+    "https://raw.githubusercontent.com/mmbateni/iran-intranet-access/main/outputs/iran_appearing.txt"
+)
 IP_ECHO_URL = "https://api.ipify.org?format=json"
 RAMZINEX_PAIRS_URL = BASE + "/exchange/api/v1.0/exchange/pairs/2"
 RAMZINEX_ORDERBOOK_URL = BASE + "/exchange/api/v1.0/exchange/orderbooks/2/buys_sells"
@@ -509,6 +512,54 @@ async def _resolve_mtproto_candidate(
         return None
 
 
+def _parse_public_vless(content: str) -> tuple[str | None, list[dict]]:
+    generated = None
+    candidates = []
+    seen = set()
+    for raw in content.splitlines():
+        line = raw.strip()
+        if line.startswith("#") and "Generated:" in line:
+            generated = line.split("Generated:", 1)[1].strip()
+            continue
+        if not line.startswith("vless://") or len(line) > 1800:
+            continue
+        try:
+            parsed = urlsplit(line)
+            uid = parsed.username or ""
+            host = parsed.hostname or ""
+            port = parsed.port
+            if not uid or not host or not port or not (1 <= port <= 65535):
+                continue
+            if not re.fullmatch(r"[0-9a-fA-F-]{16,64}", uid):
+                continue
+            key = (host.lower(), port, uid.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append({
+                "host": host,
+                "port": port,
+                "uri": line,
+                "transport": (parse_qs(parsed.query).get("type") or ["unknown"])[0],
+                "security": (parse_qs(parsed.query).get("security") or ["unknown"])[0],
+                "verified_by_source": "source claims >=2/3 GeoIP votes",
+                "connection_verified": False,
+            })
+        except Exception:
+            continue
+    return generated, candidates[:3]
+
+
+async def _fetch_public_vless(direct_client: httpx.AsyncClient) -> tuple[str | None, list[dict]]:
+    try:
+        response = await direct_client.get(VLESS_SOURCE, timeout=8.0)
+        response.raise_for_status()
+        return _parse_public_vless(response.text)
+    except Exception as exc:
+        logger.warning("Public VLESS source fetch failed: %s", type(exc).__name__)
+        return None, []
+
+
 async def _scan_mtproto(direct_client: httpx.AsyncClient) -> list[dict]:
     try:
         response = await direct_client.get(MTPROTO_SOURCE, timeout=8.0)
@@ -586,6 +637,7 @@ async def scan_iran_proxies(force: bool = False) -> dict:
                 logger.warning("Iran HTTP proxy source fetch failed: %s", type(exc).__name__)
 
             candidates = _http_proxy_candidates(source_payload)
+            vless_generated, vless_candidates = await _fetch_public_vless(direct_client)
             semaphore = asyncio.Semaphore(6)
 
             async def bounded(candidate):
@@ -605,6 +657,9 @@ async def scan_iran_proxies(force: bool = False) -> dict:
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "source_http": HTTP_PROXY_SOURCE,
             "source_mtproto": MTPROTO_SOURCE,
+            "source_vless": VLESS_SOURCE,
+            "vless_source_generated": vless_generated,
+            "vless_candidates": vless_candidates,
             "http_candidates": len(candidates),
             "http_tested": len(http_results),
             "http_diagnostics": [
@@ -679,6 +734,20 @@ async def build_daily_proxy_report(force: bool = False) -> str:
                 f"{index}) <code>{html.escape(str(row.get('ip')))}:{row.get('port')}</code> "
                 f"— API رمزینکس: {row.get('pairs_status', 'نامشخص')}/"
                 f"{row.get('orderbook_status', 'نامشخص')}"
+            )
+
+    vless = report.get("vless_candidates", [])[:3]
+    if vless:
+        lines.extend([
+            "",
+            "🧩 <b>کاندیدهای عمومی VLESS</b>",
+            "<i>فهرست مبدأ ادعای تأیید GeoIP دارد؛ اتصال Xray و کارکرد عملی هنوز آزمایش نشده است.</i>",
+        ])
+        if report.get("vless_source_generated"):
+            lines.append(f"تاریخ مبدأ: <code>{html.escape(str(report['vless_source_generated']))}</code>")
+        for index, row in enumerate(vless, 1):
+            lines.append(
+                f"{index}) <code>{html.escape(str(row.get('uri', '')))}</code>"
             )
 
     mtproto = report.get("mtproto_iran_tcp", [])[:5]
