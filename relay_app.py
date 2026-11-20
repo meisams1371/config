@@ -513,6 +513,69 @@ async def _test_http_proxy(candidate: dict, direct_client: httpx.AsyncClient) ->
         }
 
 
+async def _test_ramzinex_websocket_proxy(proxy_url: str) -> bool:
+    """Require a real WebSocket upgrade and Centrifuge connect/subscribe ACK."""
+    try:
+        async with websockets.connect(
+            WS_ENDPOINT,
+            proxy=proxy_url,
+            subprotocols=["centrifuge-json"],
+            open_timeout=14,
+            close_timeout=3,
+            ping_interval=None,
+            max_size=WS_MAX_MESSAGE_BYTES,
+            compression=None,
+        ) as ws:
+            if ws.subprotocol != "centrifuge-json":
+                return False
+
+            async def receive_matching(command_id: int, field: str, timeout_seconds: float) -> bool:
+                deadline = time.monotonic() + timeout_seconds
+                while time.monotonic() < deadline:
+                    raw = await asyncio.wait_for(
+                        ws.recv(),
+                        timeout=max(0.1, deadline - time.monotonic()),
+                    )
+                    if isinstance(raw, bytes):
+                        raw = raw.decode("utf-8", errors="replace")
+                    for line in str(raw).splitlines() or [str(raw)]:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            frame = json.loads(line)
+                        except Exception:
+                            continue
+                        if frame == {}:
+                            await ws.send("{}")
+                            continue
+                        if not isinstance(frame, dict) or frame.get("id") != command_id:
+                            continue
+                        if isinstance(frame.get(field), dict):
+                            return True
+                        if "error" in frame:
+                            return False
+                return False
+
+            await ws.send(json.dumps({
+                "connect": {"name": "x4g-auto-egress-check"},
+                "id": 1,
+            }))
+            if not await receive_matching(1, "connect", 10):
+                return False
+
+            await ws.send(json.dumps({
+                "subscribe": {"channel": "orderbook:2", "recover": True},
+                "id": 2,
+            }))
+            if not await receive_matching(2, "subscribe", 8):
+                return False
+
+            return True
+    except Exception:
+        return False
+
+
 async def _resolve_mtproto_candidate(
     host: str, port: int, secret: str, direct_client: httpx.AsyncClient
 ) -> dict | None:
@@ -839,7 +902,33 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
 
             rows = await asyncio.gather(*(bounded(candidate) for candidate in candidates))
         
-        ready = [row for row in rows if row.get("ramzinex_ready") is True and row.get("geoip", {}).get("iran_confirmed") is True]
+        http_ready = [
+            row for row in rows
+            if row.get("ramzinex_ready") is True
+            and row.get("geoip", {}).get("iran_confirmed") is True
+        ]
+        http_ready.sort(key=lambda row: (
+            row.get("proxy") != UPSTREAM_PROXY,
+            row.get("latency_ms", 999999),
+        ))
+
+        # REST-compatible open proxies aren't necessarily WebSocket-compatible.
+        # Admit a route to the live pool only after a real Centrifuge handshake
+        # and public orderbook subscription acknowledgement.
+        ws_semaphore = asyncio.Semaphore(_RAMZINEX_PROXY_POOL_SIZE)
+
+        async def verify_websocket(row: dict) -> dict | None:
+            async with ws_semaphore:
+                ok = await _test_ramzinex_websocket_proxy(str(row["proxy"]))
+                if ok:
+                    row["websocket_ready"] = True
+                    return row
+                return None
+
+        ws_results = await asyncio.gather(*(
+            verify_websocket(row) for row in http_ready[:_RAMZINEX_PROXY_POOL_SIZE]
+        ))
+        ready = [row for row in ws_results if row]
         ready.sort(key=lambda row: (
             row.get("proxy") != UPSTREAM_PROXY,
             row.get("latency_ms", 999999),
@@ -860,7 +949,7 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
             _set_ramzinex_proxy_status(
                 "unavailable",
                 0,
-                "no_iran_proxy_passed_geoip_and_ramzinex_get_checks"
+                "no_iran_proxy_passed_geoip_ramzinex_rest_and_centrifuge_websocket_checks"
                 + (f";source={source_error}" if source_error else ""),
             )
             logger.warning("Ramzinex egress pool refresh found no verified route")
