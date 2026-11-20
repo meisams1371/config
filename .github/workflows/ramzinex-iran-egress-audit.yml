@@ -1,0 +1,136 @@
+name: Ramzinex Iran egress read-only audit
+
+on:
+  push:
+    branches:
+      - ramzinex-egress-audit
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ramzinex-egress-audit
+  cancel-in-progress: true
+
+jobs:
+  test-public-proxies:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install HTTP client
+        run: python -m pip install --disable-pip-version-check "requests[socks]"
+      - name: Test Iran SOCKS5 candidates against public endpoints only
+        run: |
+          python - <<'PY'
+          import concurrent.futures
+          import json
+          import requests
+          import time
+
+          # Public unauthenticated SOCKS5 candidates collected from public
+          # proxy lists on 2026-11-20. This workflow sends only harmless
+          # GET requests; it never sends credentials or private account data.
+          CANDIDATES = [
+              ("178.252.165.226", 1080, "s4m: Iran/Rasht; reported 78% recent check rate"),
+              ("195.158.230.124", 10803, "ProxyHub: Iran; checked 2026-11-20"),
+              ("80.210.50.126", 9991, "ProxyHub: Iran; checked 2026-11-20"),
+              ("93.118.123.196", 1080, "ProxyHub/Proxifly: Iran/Tehran"),
+              ("87.107.68.231", 1081, "ProxyHub/Proxifly: Iran"),
+              ("5.144.133.195", 9050, "ProxyHub/Proxifly: Iran"),
+              ("37.32.26.209", 10808, "Proxifly: Iran"),
+          ]
+
+          TESTS = {
+              "geo_ipapi": "https://ipapi.co/json/",
+              "geo_ip_api": "http://ip-api.com/json/?fields=status,countryCode,query,isp,as",
+              "ramzinex_pairs": "https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/pairs",
+              "ramzinex_prices": "https://publicapi.ramzinex.com/exchange/api/exchange/prices",
+              "ramzinex_orderbook_2": "https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/orderbooks/2/buys_sells",
+          }
+
+          def one(candidate):
+              host, port, source = candidate
+              proxy = f"socks5h://{host}:{port}"
+              session = requests.Session()
+              session.trust_env = False
+              session.proxies.update({"http": proxy, "https": proxy})
+              session.headers.update({
+                  "User-Agent": "RamzinexPublicReadOnlyConnectivityCheck/1.0",
+                  "Accept": "application/json,text/plain,*/*",
+              })
+              result = {"proxy": f"{host}:{port}", "source": source, "checks": {}}
+              for label, url in TESTS.items():
+                  try:
+                      started = time.monotonic()
+                      response = session.get(url, timeout=(5, 9), allow_redirects=False)
+                      elapsed = round((time.monotonic() - started) * 1000)
+                      entry = {"status": response.status_code, "ms": elapsed}
+                      if label == "geo_ipapi" and response.status_code == 200:
+                          try:
+                              data = response.json()
+                              entry.update({
+                                  "ip": data.get("ip"),
+                                  "country": data.get("country_code") or data.get("country"),
+                                  "city": data.get("city"),
+                                  "org": data.get("org"),
+                              })
+                          except Exception:
+                              entry["json"] = False
+                      elif label == "geo_ip_api" and response.status_code == 200:
+                          try:
+                              data = response.json()
+                              entry.update({
+                                  "ip": data.get("query"),
+                                  "country": data.get("countryCode"),
+                                  "isp": data.get("isp"),
+                                  "as": data.get("as"),
+                              })
+                          except Exception:
+                              entry["json"] = False
+                      elif label.startswith("ramzinex_") and response.status_code == 200:
+                          try:
+                              data = response.json()
+                              entry["json"] = isinstance(data, (dict, list))
+                              if isinstance(data, dict):
+                                  entry["top_keys"] = list(data.keys())[:8]
+                                  payload = data.get("result", data.get("data"))
+                                  if isinstance(payload, list):
+                                      entry["items"] = len(payload)
+                          except Exception:
+                              entry["json"] = False
+                      result["checks"][label] = entry
+                  except Exception as exc:
+                      result["checks"][label] = {"error": type(exc).__name__}
+              session.close()
+              geo = [
+                  v.get("country") for k, v in result["checks"].items()
+                  if k.startswith("geo_") and v.get("country")
+              ]
+              result["iran_exit_confirmed"] = len(geo) >= 1 and all(c == "IR" for c in geo)
+              result["ramzinex_gets_200"] = all(
+                  result["checks"].get(k, {}).get("status") == 200
+                  for k in ("ramzinex_pairs", "ramzinex_prices", "ramzinex_orderbook_2")
+              )
+              return result
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=len(CANDIDATES)) as pool:
+              results = list(pool.map(one, CANDIDATES))
+
+          print(json.dumps(results, ensure_ascii=False, indent=2))
+          good = [r for r in results if r["iran_exit_confirmed"] and r["ramzinex_gets_200"]]
+          print(f"\nSUMMARY: {len(good)}/{len(results)} proxies passed BOTH Iran-exit and all 3 Ramzinex GET checks.")
+          with open("ramzinex-egress-results.json", "w", encoding="utf-8") as f:
+              json.dump(results, f, ensure_ascii=False, indent=2)
+          PY
+      - name: Upload audit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramzinex-iran-egress-read-only-audit
+          path: ramzinex-egress-results.json
+          if-no-files-found: ignore
+          retention-days: 3
