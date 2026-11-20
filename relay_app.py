@@ -817,6 +817,10 @@ _ramzinex_proxy_checked_at = 0.0
 _ramzinex_proxy_status: dict = {
     "state": "not_checked",
     "verified_count": 0,
+    "candidate_count": 0,
+    "http_ready_count": 0,
+    "websocket_tested_count": 0,
+    "websocket_ready_count": 0,
     "checked_at": None,
     "last_error": None,
 }
@@ -968,6 +972,12 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
             )
             logger.warning("Ramzinex egress pool refresh found no verified route")
 
+        _ramzinex_proxy_status.update({
+            "candidate_count": len(candidates),
+            "http_ready_count": len(http_ready),
+            "websocket_tested_count": min(len(http_ready), _RAMZINEX_WS_VERIFY_LIMIT),
+            "websocket_ready_count": len(ready),
+        })
         return {**_ramzinex_proxy_status, "cached": False}
 
 
@@ -1147,6 +1157,10 @@ async def health() -> dict:
         "proxy_pool": {
             "state": _ramzinex_proxy_status.get("state"),
             "verified_count": len(_ramzinex_proxy_urls),
+            "candidate_count": _ramzinex_proxy_status.get("candidate_count", 0),
+            "http_ready_count": _ramzinex_proxy_status.get("http_ready_count", 0),
+            "websocket_tested_count": _ramzinex_proxy_status.get("websocket_tested_count", 0),
+            "websocket_ready_count": _ramzinex_proxy_status.get("websocket_ready_count", 0),
             "checked_at": _ramzinex_proxy_status.get("checked_at"),
             "last_error": _ramzinex_proxy_status.get("last_error"),
             "refresh_seconds": _RAMZINEX_PROXY_REFRESH_SECONDS,
