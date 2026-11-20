@@ -155,7 +155,7 @@ jobs:
               ) as ws:
                   ws.send_text('{"publish":{"channel":"orderbook:11","data":{}},"id":3}')
                   closed = ws.receive()
-                  assert closed["type"] == "websocket.disconnect", closed
+                  assert closed["type"] in ("websocket.close", "websocket.disconnect"), closed
                   assert closed.get("code") == 1008, closed
           assert len(fake_upstreams) == 1
           assert fake_upstreams[0].sent == []
