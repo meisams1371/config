@@ -8,6 +8,8 @@ on:
     paths:
       - "scripts/ramzinex-centrifuge-probe.mjs"
       - ".github/workflows/ramzinex-centrifuge-ws-probe.yml"
+      - "relay_app.py"
+      - "requirements.txt"
 
 permissions:
   contents: read
@@ -15,13 +17,73 @@ permissions:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install scanner dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Find read-only Iran egress routes that pass Ramzinex REST checks
+        run: |
+          python - <<'PY'
+          import asyncio, json, os
+          from urllib.parse import urlsplit
+          import relay_app
+
+          async def main():
+              report = await relay_app.scan_iran_proxies(force=True)
+              valid = []
+              for row in report.get("ramzinex_ready", []):
+                  proxy = str(row.get("proxy") or "").strip()
+                  try:
+                      parsed = urlsplit(proxy)
+                      safe = (
+                          parsed.scheme in ("http", "https")
+                          and bool(parsed.hostname)
+                          and parsed.port is not None
+                          and parsed.username is None
+                          and parsed.password is None
+                          and not parsed.query
+                          and not parsed.fragment
+                          and row.get("geoip", {}).get("iran_confirmed") is True
+                          and row.get("ramzinex_ready") is True
+                      )
+                  except Exception:
+                      safe = False
+                  if safe:
+                      valid.append((proxy, row))
+              valid.sort(key=lambda item: item[1].get("latency_ms", 999999))
+              valid = valid[:3]
+              if valid:
+                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+                      env.write("RAMZINEX_WS_HTTP_PROXIES=" + ",".join(item[0] for item in valid) + "\n")
+              safe_report = {
+                  "checked_at": report.get("checked_at"),
+                  "verified_routes_count": len(valid),
+                  "routes": [
+                      {
+                          "route_index": index + 1,
+                          "city": row.get("geoip", {}).get("city"),
+                          "latency_ms": row.get("latency_ms"),
+                          "pairs_status": row.get("pairs_status"),
+                          "orderbook_status": row.get("orderbook_status"),
+                          "iran_geoip_confirmed": row.get("geoip", {}).get("iran_confirmed"),
+                          "ramzinex_rest_confirmed": row.get("ramzinex_ready"),
+                      }
+                      for index, (_, row) in enumerate(valid)
+                  ],
+                  "proxy_values_written_to_github_env": bool(valid),
+                  "warning": "Only uncredentialed public market-data traffic is tested; discovered proxy URLs are not printed.",
+              }
+              print(json.dumps(safe_report, ensure_ascii=False, indent=2))
+          asyncio.run(main())
+          PY
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install official Centrifuge SDK and Node WebSocket transport
+      - name: Install official Centrifuge SDK and WebSocket proxy transport
         run: npm install --no-save --no-package-lock centrifuge@5.3.4 ws@8.18.3 https-proxy-agent@7.0.6
       - name: Connect, subscribe, and observe public market channels
         env:
