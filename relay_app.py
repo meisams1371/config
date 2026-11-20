@@ -30,8 +30,10 @@ from typing import Deque
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
+from starlette.websockets import WebSocketState
+import websockets
 
 logger = logging.getLogger("X4G.ramzinex_relay")
 
@@ -51,6 +53,11 @@ UPSTREAM_PROXY = os.environ.get("RAMZINEX_UPSTREAM_PROXY", "").strip()
 BASE = "https://publicapi.ramzinex.com"
 TIMEOUT = httpx.Timeout(connect=5.0, read=12.0, write=5.0, pool=5.0)
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+WS_ENDPOINT = "wss://websocket.ramzinex.ir/websocket"
+WS_MAX_MESSAGE_BYTES = 64 * 1024
+WS_MAX_CONNECTIONS_PER_IP = 3
+WS_MAX_CONNECTIONS_TOTAL = 100
+_PUBLIC_WS_CHANNEL = re.compile(r"^(?:orderbook|last-trades):[1-9][0-9]{0,8}$|^public:orderbook:[1-9][0-9]{0,8}$")
 RATE_LIMIT_PER_MINUTE = 40
 RATE_WINDOW_SECONDS = 60
 
@@ -59,6 +66,9 @@ _cache_at = 0.0
 _cache_lock = asyncio.Lock()
 _rate_lock = asyncio.Lock()
 _rate_buckets: dict[str, Deque[float]] = defaultdict(deque)
+_ws_active_by_ip: dict[str, int] = defaultdict(int)
+_ws_active_total = 0
+_ws_active_lock = asyncio.Lock()
 
 PAIR_ID = r"[1-9][0-9]{0,8}"
 _ALLOWED_PATTERNS = (
@@ -783,6 +793,168 @@ async def health() -> dict:
         "relay_token_configured": len(TOKEN) >= 32,
         "mode": "GET-only, allow-listed",
     }
+
+
+def _valid_ws_token(supplied: str) -> bool:
+    return bool(TOKEN) and hmac.compare_digest(supplied or "", TOKEN)
+
+
+def _is_allowed_centrifuge_frame(frame: str) -> bool:
+    """Allow only Centrifuge connect/subscribe/unsubscribe for public market channels."""
+    if not isinstance(frame, str):
+        return False
+    try:
+        if len(frame.encode("utf-8")) > WS_MAX_MESSAGE_BYTES:
+            return False
+    except Exception:
+        return False
+
+    lines = [line.strip() for line in frame.splitlines() if line.strip()]
+    if not lines or len(lines) > 32:
+        return False
+
+    for line in lines:
+        try:
+            command = json.loads(line)
+        except Exception:
+            return False
+        if command == {}:
+            # Centrifuge application-level ping/pong.
+            continue
+        if not isinstance(command, dict):
+            return False
+
+        command_names = [name for name in ("connect", "subscribe", "unsubscribe") if name in command]
+        if len(command_names) != 1 or set(command) - {"id", command_names[0]}:
+            return False
+
+        name = command_names[0]
+        body = command.get(name)
+        if not isinstance(body, dict):
+            return False
+
+        if name == "connect":
+            # The relay never forwards client-supplied auth tokens or server-side/private subscriptions.
+            if set(body) - {"name", "version"}:
+                return False
+        elif name == "subscribe":
+            if set(body) - {"channel", "recover", "delta", "offset", "epoch"}:
+                return False
+            channel = body.get("channel")
+            if not isinstance(channel, str) or not _PUBLIC_WS_CHANNEL.fullmatch(channel):
+                return False
+            if body.get("delta") not in (None, "fossil"):
+                return False
+        elif name == "unsubscribe":
+            if set(body) != {"sid"} or not isinstance(body.get("sid"), (str, int)):
+                return False
+
+    return True
+
+
+async def _ws_connection_acquire(client_ip: str) -> bool:
+    global _ws_active_total
+    async with _ws_active_lock:
+        if _ws_active_total >= WS_MAX_CONNECTIONS_TOTAL:
+            return False
+        if _ws_active_by_ip[client_ip] >= WS_MAX_CONNECTIONS_PER_IP:
+            return False
+        _ws_active_by_ip[client_ip] += 1
+        _ws_active_total += 1
+        return True
+
+
+async def _ws_connection_release(client_ip: str) -> None:
+    global _ws_active_total
+    async with _ws_active_lock:
+        if _ws_active_by_ip.get(client_ip, 0) > 0:
+            _ws_active_by_ip[client_ip] -= 1
+            _ws_active_total = max(0, _ws_active_total - 1)
+        if _ws_active_by_ip.get(client_ip, 0) <= 0:
+            _ws_active_by_ip.pop(client_ip, None)
+
+
+async def _ws_client_to_upstream(websocket: WebSocket, upstream) -> None:
+    while True:
+        event = await websocket.receive()
+        if event.get("type") == "websocket.disconnect":
+            return
+        message = event.get("text")
+        if message is None or not _is_allowed_centrifuge_frame(message):
+            await websocket.close(code=1008, reason="public market channels are read-only")
+            return
+        await upstream.send(message)
+
+
+async def _ws_upstream_to_client(websocket: WebSocket, upstream) -> None:
+    async for message in upstream:
+        if isinstance(message, str):
+            await websocket.send_text(message)
+        else:
+            await websocket.send_bytes(message)
+
+
+@app.websocket("/ws")
+async def ramzinex_public_websocket(websocket: WebSocket):
+    """Authenticated, read-only Centrifuge WebSocket tunnel to Ramzinex."""
+    supplied = websocket.headers.get("x-relay-token", "")
+    if not _valid_ws_token(supplied):
+        await websocket.close(code=1008)
+        return
+    try:
+        _require_config()
+        await _rate_check(websocket)
+    except HTTPException:
+        await websocket.close(code=1013)
+        return
+
+    client_ip = websocket.client.host if websocket.client else "unknown"
+    if not await _ws_connection_acquire(client_ip):
+        await websocket.close(code=1013)
+        return
+
+    accepted = False
+    try:
+        async with websockets.connect(
+            WS_ENDPOINT,
+            proxy=UPSTREAM_PROXY,
+            subprotocols=["centrifuge-json"],
+            open_timeout=12,
+            close_timeout=4,
+            ping_interval=20,
+            ping_timeout=20,
+            max_size=WS_MAX_MESSAGE_BYTES,
+            compression=None,
+        ) as upstream:
+            if upstream.subprotocol != "centrifuge-json":
+                await websocket.close(code=1011)
+                return
+            await websocket.accept(subprotocol="centrifuge-json")
+            accepted = True
+            client_task = asyncio.create_task(_ws_client_to_upstream(websocket, upstream))
+            upstream_task = asyncio.create_task(_ws_upstream_to_client(websocket, upstream))
+            tasks = {client_task, upstream_task}
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                error = task.exception()
+                if error and not isinstance(error, WebSocketDisconnect):
+                    raise error
+            if websocket.client_state == WebSocketState.CONNECTED and websocket.application_state == WebSocketState.CONNECTED:
+                await websocket.close(code=1000)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        logger.warning("Ramzinex WebSocket relay failed type=%s", type(exc).__name__)
+        if accepted and websocket.application_state == WebSocketState.CONNECTED:
+            try:
+                await websocket.close(code=1011, reason="upstream unavailable")
+            except Exception:
+                pass
+    finally:
+        await _ws_connection_release(client_ip)
 
 
 @app.get("/ramzinex/{path:path}")

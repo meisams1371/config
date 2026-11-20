@@ -52,5 +52,28 @@ jobs:
           )
           assert denied_query.status_code == 400, denied_query.text
 
-          print("relay syntax and guardrail tests passed")
+          # Verify the WebSocket bridge only forwards public, read-only Centrifuge commands.
+          assert relay_app._valid_ws_token(relay_app.TOKEN) is True
+          assert relay_app._valid_ws_token("wrong-test-token") is False
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"connect":{"name":"js"},"id":1}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"subscribe":{"channel":"orderbook:11","recover":true,"delta":"fossil"},"id":2}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"subscribe":{"channel":"last-trades:11","recover":true,"delta":"fossil"},"id":3}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame('{}')
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"subscribe":{"channel":"private:orders:11"},"id":4}'
+          )
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"publish":{"channel":"orderbook:11","data":{}},"id":5}'
+          )
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"connect":{"name":"js","token":"private-token"},"id":6}'
+          )
+
+          print("relay syntax, guardrail, and read-only WebSocket tests passed")
           PY
