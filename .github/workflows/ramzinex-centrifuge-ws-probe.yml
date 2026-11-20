@@ -8,6 +8,7 @@ on:
     paths:
       - "scripts/ramzinex-centrifuge-probe.mjs"
       - "scripts/ramzinex-relay-live-smoke.py"
+      - "ramzinex_relay_smoke_server.py"
       - ".github/workflows/ramzinex-centrifuge-ws-probe.yml"
       - "relay_app.py"
       - "requirements.txt"
