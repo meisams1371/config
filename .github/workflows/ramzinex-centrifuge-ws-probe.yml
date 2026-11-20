@@ -1,0 +1,27 @@
+name: Ramzinex official Centrifuge WebSocket probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ramzinex-x4g-iran-egress
+    paths:
+      - "scripts/ramzinex-centrifuge-probe.mjs"
+      - ".github/workflows/ramzinex-centrifuge-ws-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install official Centrifuge SDK and Node WebSocket transport
+        run: npm install --no-save --no-package-lock centrifuge@5.3.4 ws@8.18.3
+      - name: Connect, subscribe, and observe public market channels
+        run: node scripts/ramzinex-centrifuge-probe.mjs
