@@ -43,7 +43,7 @@ jobs:
           import relay_app
           import telegram_bot
 
-          sample = "\\n".join([
+          sample = "\n".join([
               "vless://12345678-1234-1234-1234-123456789abc@example.ir:443?type=ws&security=tls#test",
               "vless://12345678-1234-1234-1234-123456789abd@example2.ir:443?type=tcp&security=reality#test2",
               "vless://12345678-1234-1234-1234-123456789abe@example3.ir:443?type=ws&security=tls#test3",
