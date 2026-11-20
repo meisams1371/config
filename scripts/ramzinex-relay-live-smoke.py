@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 
@@ -144,36 +145,53 @@ def main() -> None:
     env["RAMZINEX_UPSTREAM_PROXY"] = proxy
     env["RAMZINEX_RELAY_TOKEN"] = TOKEN
 
+    server_log = tempfile.TemporaryFile(mode="w+t", encoding="utf-8")
     server = subprocess.Popen(
         [
             sys.executable, "-m", "uvicorn", "relay_app:app",
             "--host", "127.0.0.1", "--port", str(port), "--log-level", "warning",
         ],
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
     )
     try:
         health_url = f"http://127.0.0.1:{port}/health"
+
+        def read_health() -> dict:
+            try:
+                with urllib.request.urlopen(health_url, timeout=2) as response:
+                    return json.loads(response.read().decode("utf-8")) if response.status == 200 else {}
+            except Exception:
+                return {}
+
         ready = False
         for _ in range(80):
             if server.poll() is not None:
                 raise RuntimeError("Local relay process exited before becoming healthy")
-            try:
-                with urllib.request.urlopen(health_url, timeout=1) as response:
-                    health = json.loads(response.read().decode("utf-8"))
-                    ready = response.status == 200 and health.get("upstream_proxy_configured") is True
-                    if ready:
-                        break
-            except Exception:
-                time.sleep(0.25)
+            health = read_health()
+            ready = bool(health.get("ok") is True and health.get("relay_token_configured") is True)
+            if ready:
+                break
+            time.sleep(0.25)
         if not ready:
             raise TimeoutError("Local Ramzinex relay did not become healthy")
 
-        result = asyncio.run(run_smoke(f"ws://127.0.0.1:{port}/ws"))
+        try:
+            result = asyncio.run(run_smoke(f"ws://127.0.0.1:{port}/ws"))
+        except Exception as exc:
+            print(json.dumps({
+                "test": "live Ramzinex WebSocket through the new Python relay",
+                "ok": False,
+                "failure_type": type(exc).__name__,
+                "proxy_pool": read_health().get("proxy_pool"),
+            }, ensure_ascii=False, indent=2))
+            raise
+
         print(json.dumps({
             "test": "live Ramzinex WebSocket through the new Python relay",
             "upstream_route": "verified-Iran-Ramzinex-proxy",
+            "proxy_pool": read_health().get("proxy_pool"),
             **result,
         }, ensure_ascii=False, indent=2))
     finally:
@@ -183,6 +201,13 @@ def main() -> None:
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait(timeout=4)
+        server_log.flush()
+        server_log.seek(0)
+        log_tail = server_log.read()[-6000:]
+        if log_tail.strip():
+            print("LOCAL RELAY SERVER LOG (proxy values are not logged):")
+            print(log_tail)
+        server_log.close()
 
 
 if __name__ == "__main__":
