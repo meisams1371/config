@@ -54,14 +54,60 @@ jobs:
                       safe = False
                   if safe:
                       valid.append((proxy, row))
+              route_source = "live-scan"
+              # If the live public list is temporarily stale, re-verify a few endpoints
+              # that passed the Iran + Ramzinex REST checks in an earlier CI run.
+              # These are only used when the same live verification passes again now.
+              if not valid:
+                  import ipaddress, httpx
+                  route_source = "previously-verified-recheck"
+                  seed_urls = [
+                      "http://80.191.46.62:1090",
+                      "http://2.179.95.57:8080",
+                      "http://185.129.213.210:8080",
+                  ]
+                  async with httpx.AsyncClient(
+                      timeout=relay_app._DIRECT_TIMEOUT,
+                      follow_redirects=False,
+                      trust_env=False,
+                      headers={"User-Agent": "X4G-WS-Route-Recheck/1.0"},
+                  ) as direct_client:
+                      async def recheck(proxy):
+                          parsed = urlsplit(proxy)
+                          ip = str(parsed.hostname or "")
+                          try:
+                              address = ipaddress.ip_address(ip)
+                              if parsed.scheme not in ("http", "https") or not address.is_global or not parsed.port:
+                                  return None
+                          except Exception:
+                              return None
+                          candidate = {
+                              "proxy": proxy,
+                              "ip": ip,
+                              "port": parsed.port,
+                              "anonymity": "previously-verified",
+                              "listed_city": "Unknown",
+                          }
+                          try:
+                              row = await relay_app._test_http_proxy(candidate, direct_client)
+                              if row.get("ramzinex_ready") is True and row.get("geoip", {}).get("iran_confirmed") is True:
+                                  return (proxy, row)
+                          except Exception:
+                              return None
+                          return None
+                      checked = await asyncio.gather(*(recheck(proxy) for proxy in seed_urls))
+                      valid.extend(item for item in checked if item)
               valid.sort(key=lambda item: item[1].get("latency_ms", 999999))
               valid = valid[:3]
+              if not valid:
+                  route_source = "none"
               if valid:
                   with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
                       env.write("RAMZINEX_WS_HTTP_PROXIES=" + ",".join(item[0] for item in valid) + "\n")
               safe_report = {
                   "checked_at": report.get("checked_at"),
                   "verified_routes_count": len(valid),
+                  "route_source": route_source,
                   "routes": [
                       {
                           "route_index": index + 1,
