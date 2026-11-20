@@ -161,27 +161,35 @@ def _upstream_path(path: str) -> str:
 
 async def _fetch_upstream(path: str, params: dict[str, str] | None = None) -> tuple[int, bytes, dict[str, str]]:
     target = BASE + _upstream_path(path)
-    async with httpx.AsyncClient(
-        proxies=UPSTREAM_PROXY,
-        timeout=TIMEOUT,
-        follow_redirects=False,
-        trust_env=False,
-        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
-        headers={
-            "User-Agent": "X4G-Ramzinex-ReadOnlyRelay/1.0",
-            "Accept": "application/json",
-        },
-    ) as client:
-        async with client.stream("GET", target, params=params or {}) as upstream:
-            body = await upstream.aread()
-            if len(body) > MAX_RESPONSE_BYTES:
-                raise HTTPException(status_code=502, detail="Upstream response exceeded size limit")
-            headers = {}
-            for name in ("content-type", "cache-control", "etag", "last-modified"):
-                value = upstream.headers.get(name)
-                if value:
-                    headers[name] = value
-            return upstream.status_code, body, headers
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(
+                proxies=UPSTREAM_PROXY,
+                timeout=TIMEOUT,
+                follow_redirects=False,
+                trust_env=False,
+                limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+                headers={
+                    "User-Agent": "X4G-Ramzinex-ReadOnlyRelay/1.0",
+                    "Accept": "application/json",
+                },
+            ) as client:
+                async with client.stream("GET", target, params=params or {}) as upstream:
+                    body = await upstream.aread()
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        raise HTTPException(status_code=502, detail="Upstream response exceeded size limit")
+                    headers = {}
+                    for name in ("content-type", "cache-control", "etag", "last-modified"):
+                        value = upstream.headers.get(name)
+                        if value:
+                            headers[name] = value
+                    return upstream.status_code, body, headers
+        except httpx.RequestError:
+            if attempt >= 2:
+                raise
+            # The tested public Iran proxy has occasional transient connection
+            # failures, so retry the read-only request twice before giving up.
+            await asyncio.sleep(0.4 * (attempt + 1))
 
 
 def _json_summary(name: str, status: int, body: bytes) -> dict:
