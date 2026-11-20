@@ -36,6 +36,83 @@ function summarizeData(data) {
   return { type: typeof data };
 }
 
+const RAW_CONNECT_TIMEOUT_MS = 9000;
+
+
+async function probeRawCentrifugeConnect() {
+  return new Promise((resolve) => {
+    const result = {
+      websocket_upgrade: false,
+      connect_command_sent: false,
+      connect_acknowledged: false,
+      protocol: 'centrifuge-json',
+    };
+    let settled = false;
+    let timer;
+    const socket = new WebSocket(ENDPOINT, 'centrifuge-json', { handshakeTimeout: 7000 });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { socket.close(); } catch { /* ignored */ }
+      resolve(result);
+    };
+    timer = setTimeout(() => {
+      result.error = 'raw Centrifuge connect acknowledgement timed out';
+      finish();
+    }, RAW_CONNECT_TIMEOUT_MS);
+    socket.on('open', () => {
+      result.websocket_upgrade = true;
+      result.negotiated_protocol = socket.protocol || null;
+      socket.send(JSON.stringify({ connect: { name: 'js' }, id: 1 }));
+      result.connect_command_sent = true;
+    });
+    socket.on('message', (raw) => {
+      const body = raw.toString();
+      if (body.trim() === '{}') {
+        try { socket.send('{}'); } catch { /* connection may be closing */ }
+        result.application_ping_seen = true;
+        return;
+      }
+      try {
+        const message = JSON.parse(body);
+        if (message && message.id === 1 && message.connect) {
+          result.connect_acknowledged = true;
+          result.server_version_present = Boolean(message.connect.version);
+          result.client_id_present = Boolean(message.connect.client);
+          finish();
+        } else if (message && message.id === 1 && message.error) {
+          result.server_error = {
+            code: Number.isFinite(message.error.code) ? message.error.code : null,
+            message: safeMessage(message.error.message),
+          };
+          finish();
+        }
+      } catch {
+        result.non_json_message_received = true;
+      }
+    });
+    socket.on('unexpected-response', (_request, response) => {
+      result.http_status = response.statusCode || null;
+      result.error = 'WebSocket upgrade was rejected by the HTTP server';
+      response.resume();
+      finish();
+    });
+    socket.on('error', (error) => {
+      result.error = String(error && error.name || 'Error') + ': ' + safeMessage(error && error.message || error);
+      finish();
+    });
+    socket.on('close', (code, reason) => {
+      result.close_code = code;
+      if (reason && reason.length) result.close_reason = safeMessage(reason.toString());
+      if (!result.connect_acknowledged && !result.error) {
+        result.error = 'Socket closed before connect acknowledgement';
+      }
+      finish();
+    });
+  });
+}
+
 const report = {
   checked_at: new Date().toISOString(),
   endpoint: ENDPOINT,
@@ -45,8 +122,19 @@ const report = {
   publication_window_ms: PUBLICATION_WINDOW_MS,
 };
 
+report.raw_protocol_probe = await probeRawCentrifugeConnect();
+
 const client = new Centrifuge(ENDPOINT, { websocket: WebSocket });
 
+client.on('error', (ctx) => {
+  const err = ctx && ctx.error || ctx;
+  report.connection.errors = report.connection.errors || [];
+  report.connection.errors.push({
+    type: safeMessage(ctx && ctx.type),
+    code: Number.isFinite(err && err.code) ? err.code : null,
+    message: safeMessage(err && (err.message || err.reason) || 'client error'),
+  });
+});
 client.on('connecting', () => {
   report.connection.connecting_events = (report.connection.connecting_events ?? 0) + 1;
 });
