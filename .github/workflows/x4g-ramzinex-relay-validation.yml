@@ -65,6 +65,23 @@ jobs:
               '{"subscribe":{"channel":"last-trades:11","recover":true,"delta":"fossil"},"id":3}'
           )
           assert relay_app._is_allowed_centrifuge_frame('{}')
+          # Both common unsubscribe forms are safe only for public subscriptions.
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"unsubscribe":{"channel":"orderbook:11"},"id":7}'
+          )
+          assert relay_app._is_allowed_centrifuge_frame(
+              '{"unsubscribe":{"sid":"7"},"id":8}'
+          )
+          assert not relay_app._is_allowed_centrifuge_frame(
+              '{"unsubscribe":{"channel":"private:orders:11"},"id":9}'
+          )
+          # An unauthenticated browser WebSocket must be rejected before upstream access.
+          from starlette.websockets import WebSocketDisconnect
+          try:
+              with client.websocket_connect("/ws"):
+                  raise AssertionError("unauthenticated WebSocket was accepted")
+          except WebSocketDisconnect as exc:
+              assert exc.code == 1008, exc.code
           assert not relay_app._is_allowed_centrifuge_frame(
               '{"subscribe":{"channel":"private:orders:11"},"id":4}'
           )

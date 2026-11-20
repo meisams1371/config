@@ -846,7 +846,14 @@ def _is_allowed_centrifuge_frame(frame: str) -> bool:
             if body.get("delta") not in (None, "fossil"):
                 return False
         elif name == "unsubscribe":
-            if set(body) != {"sid"} or not isinstance(body.get("sid"), (str, int)):
+            if set(body) == {"sid"}:
+                if not isinstance(body.get("sid"), (str, int)):
+                    return False
+            elif set(body) == {"channel"}:
+                channel = body.get("channel")
+                if not isinstance(channel, str) or not _PUBLIC_WS_CHANNEL.fullmatch(channel):
+                    return False
+            else:
                 return False
 
     return True
