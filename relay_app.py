@@ -521,7 +521,7 @@ def _parse_public_vless(content: str) -> tuple[str | None, list[dict]]:
         if line.startswith("#") and "Generated:" in line:
             generated = line.split("Generated:", 1)[1].strip()
             continue
-        if not line.startswith("vless://") or len(line) > 1800:
+        if not line.startswith("vless://") or len(line) > 1100 or "{" in line or "}" in line:
             continue
         try:
             parsed = urlsplit(line)
@@ -547,7 +547,7 @@ def _parse_public_vless(content: str) -> tuple[str | None, list[dict]]:
             })
         except Exception:
             continue
-    return generated, candidates[:3]
+    return generated, candidates[:2]
 
 
 async def _fetch_public_vless(direct_client: httpx.AsyncClient) -> tuple[str | None, list[dict]]:
