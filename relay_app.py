@@ -804,6 +804,13 @@ _RAMZINEX_PROXY_REFRESH_SECONDS = max(
     180, min(3600, int(os.environ.get("RAMZINEX_PROXY_REFRESH_SECONDS", "600")))
 )
 _RAMZINEX_PROXY_POOL_SIZE = 5
+# Previously verified public endpoints are treated only as candidates. They are
+# re-tested from scratch on every refresh and never trusted or used blindly.
+_RAMZINEX_LAST_KNOWN_PROXY_CANDIDATES = (
+    "http://80.191.46.62:1090",
+    "http://2.179.95.57:8080",
+    "http://185.129.213.210:8080",
+)
 _ramzinex_proxy_urls: list[str] = []
 _ramzinex_proxy_checked_at = 0.0
 _ramzinex_proxy_status: dict = {
@@ -874,6 +881,12 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
         configured = _proxy_candidate_from_config(UPSTREAM_PROXY) if UPSTREAM_PROXY else None
         if configured:
             candidates.append(configured)
+        for known_proxy in _RAMZINEX_LAST_KNOWN_PROXY_CANDIDATES:
+            candidate = _proxy_candidate_from_config(known_proxy)
+            if candidate:
+                candidate["anonymity"] = "previously-verified-recheck"
+                candidate["listed_city"] = "unknown"
+                candidates.append(candidate)
 
         source_error = None
         async with httpx.AsyncClient(
