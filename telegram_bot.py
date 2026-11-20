@@ -11,6 +11,9 @@ import re
 import httpx
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from relay_app import build_daily_proxy_report
 
 from main import (
     LINKS,
@@ -44,7 +47,16 @@ PAGE_SIZE = 6
 
 _client: httpx.AsyncClient | None = None
 _poll_task: asyncio.Task | None = None
+_daily_report_task: asyncio.Task | None = None
 _running = False
+
+REPORT_TZ_NAME = os.environ.get("IRAN_PROXY_REPORT_TIMEZONE", "Asia/Baku").strip() or "Asia/Baku"
+REPORT_TZ = ZoneInfo(REPORT_TZ_NAME)
+try:
+    REPORT_HOUR = max(0, min(23, int(os.environ.get("IRAN_PROXY_REPORT_HOUR", "9"))))
+    REPORT_MINUTE = max(0, min(59, int(os.environ.get("IRAN_PROXY_REPORT_MINUTE", "0"))))
+except ValueError:
+    REPORT_HOUR, REPORT_MINUTE = 9, 0
 _pending: dict = {}   # chat_id -> {"action": "wizard", "step": "...", "data": {...}}
 
 # ── Config creation wizard ────────────────────────────────────────────────────
@@ -305,7 +317,17 @@ async def _handle_message(msg: dict):
 
     if text in ("/start", "/menu"):
         _pending.pop(chat_id, None)
-        await _send(chat_id, "👋 به ربات مدیریت X4G خوش اومدی.\nاز دکمه‌های زیر برای مدیریت کانفیگ‌ها استفاده کن:", _main_menu_kb())
+        await _send(chat_id, "👋 به ربات مدیریت X4G خوش اومدی.\nاز دکمه‌های زیر برای مدیریت کانفیگ‌ها استفاده کن.\n\nبرای گزارش فوری پروکسی‌های ایران دستور /iranproxies رو بفرست. گزارش روزانه هم به همین حساب ارسال می‌شه.", _main_menu_kb())
+        return
+
+    if text.split("@", 1)[0].lower() in ("/iranproxies", "/iranproxy", "/irreport"):
+        await _send(chat_id, "🔎 در حال بررسی پروکسی‌های عمومی ایران و API رمزینکس...")
+        try:
+            report = await build_daily_proxy_report(force=True)
+            await _send(chat_id, report)
+        except Exception as exc:
+            logger.warning("Manual Iran proxy report failed: %s", type(exc).__name__)
+            await _send(chat_id, "❌ تهیهٔ گزارش پروکسی‌های ایران ناموفق بود. جزئیات در لاگ سرویس ثبت شد.")
         return
 
     if text == "/cancel":
@@ -596,22 +618,79 @@ async def _poll_loop():
             await asyncio.sleep(3)
 
 # ── Lifecycle ────────────────────────────────────────────────────────────────
+async def _send_daily_iran_proxy_report():
+    if not ADMIN_IDS:
+        return
+    try:
+        report = await build_daily_proxy_report(force=True)
+        for admin_id in sorted(ADMIN_IDS):
+            await _send(admin_id, report)
+            await asyncio.sleep(0.25)
+        logger.info("Daily Iranian proxy report sent to %s Telegram admin(s)", len(ADMIN_IDS))
+    except Exception as exc:
+        logger.warning("Daily Iranian proxy report failed: %s", type(exc).__name__)
+
+
+async def _daily_report_loop():
+    while _running:
+        now = datetime.now(REPORT_TZ)
+        next_run = now.replace(
+            hour=REPORT_HOUR, minute=REPORT_MINUTE, second=0, microsecond=0
+        )
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        delay = max(1.0, (next_run - now).total_seconds())
+        logger.info(
+            "Next Iranian proxy Telegram report scheduled for %s",
+            next_run.isoformat(),
+        )
+        try:
+            await asyncio.sleep(delay)
+            if _running:
+                await _send_daily_iran_proxy_report()
+                await asyncio.sleep(65)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.warning("Iran proxy report scheduler error: %s", type(exc).__name__)
+            await asyncio.sleep(60)
+
+
 async def start_bot():
-    global _client, _poll_task, _running
+    global _client, _poll_task, _daily_report_task, _running
     if not BOT_TOKEN:
         logger.info("Telegram bot: TELEGRAM_BOT_TOKEN تنظیم نشده، ربات غیرفعاله.")
         return
     if not ADMIN_IDS:
-        logger.warning("Telegram bot: TELEGRAM_ADMIN_IDS تنظیم نشده، هیچ‌کس اجازه‌ی مدیریت نداره (ربات روشنه ولی همه رد می‌شن).")
+        logger.warning(
+            "Telegram bot: TELEGRAM_ADMIN_IDS تنظیم نشده؛ polling روشن می‌شود "
+            "اما گزارش روزانه گیرنده ندارد."
+        )
     _client = httpx.AsyncClient(timeout=httpx.Timeout(40.0, connect=10.0))
     _running = True
     _poll_task = asyncio.create_task(_poll_loop())
+    if ADMIN_IDS:
+        _daily_report_task = asyncio.create_task(_daily_report_loop())
+        logger.info(
+            "Daily Iran proxy Telegram report enabled: %02d:%02d %s",
+            REPORT_HOUR, REPORT_MINUTE, REPORT_TZ_NAME,
+        )
+
 
 async def stop_bot():
-    global _running, _client
+    global _running, _client, _poll_task, _daily_report_task
     _running = False
-    if _poll_task:
-        _poll_task.cancel()
+    for task in (_poll_task, _daily_report_task):
+        if task:
+            task.cancel()
+    for task in (_poll_task, _daily_report_task):
+        if task:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    _poll_task = None
+    _daily_report_task = None
     if _client:
         await _client.aclose()
         _client = None
