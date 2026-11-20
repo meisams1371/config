@@ -25,6 +25,7 @@ import socket
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Deque
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -248,7 +249,7 @@ _scan_cache: dict | None = None
 _scan_cache_at = 0.0
 _scan_lock = asyncio.Lock()
 _SCAN_TTL_SECONDS = 1800
-_HTTP_SCAN_LIMIT = max(8, min(36, int(os.environ.get("IRAN_PROXY_SCAN_LIMIT", "24"))))
+_HTTP_SCAN_LIMIT = max(8, min(36, int(os.environ.get("IRAN_PROXY_SCAN_LIMIT", "36"))))
 _MTPROTO_SCAN_LIMIT = max(8, min(36, int(os.environ.get("IRAN_MTPROTO_SCAN_LIMIT", "20"))))
 _DIRECT_TIMEOUT = httpx.Timeout(connect=6.0, read=8.0, write=6.0, pool=4.0)
 
@@ -637,7 +638,7 @@ async def build_daily_proxy_report(force: bool = False) -> str:
     report = await scan_iran_proxies(force=force)
     checked = report.get("checked_at", "")
     try:
-        checked_display = datetime.fromisoformat(checked).astimezone().strftime("%Y-%m-%d %H:%M")
+        checked_display = datetime.fromisoformat(checked).astimezone(ZoneInfo("Asia/Baku")).strftime("%Y-%m-%d %H:%M")
     except Exception:
         checked_display = checked or "نامشخص"
 
