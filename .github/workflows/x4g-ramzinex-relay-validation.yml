@@ -28,6 +28,7 @@ jobs:
           python - <<'PY'
           from fastapi.testclient import TestClient
           import relay_app
+          import asyncio
           import time
 
           # Seed a local-only verified route so the ASGI bridge test performs no
