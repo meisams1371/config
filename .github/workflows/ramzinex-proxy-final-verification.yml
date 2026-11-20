@@ -1,0 +1,138 @@
+name: Ramzinex Iran proxy final verification
+
+on:
+  push:
+    branches:
+      - ramzinex-proxy-finaltest
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ramzinex-proxy-finaltest
+  cancel-in-progress: true
+
+jobs:
+  verify-one-proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install requests
+        run: python -m pip install --disable-pip-version-check requests
+      - name: Verify public proxy exit IP and Ramzinex read-only data
+        run: |
+          python - <<'PY'
+          import json, time
+          from pathlib import Path
+          import requests
+
+          PROXY = "http://2.179.95.57:8080"
+          s = requests.Session()
+          s.trust_env = False
+          s.proxies.update({"http": PROXY, "https": PROXY})
+          s.headers.update({
+            "User-Agent": "RamzinexPublicReadOnlyConnectivityCheck/1.0",
+            "Accept": "application/json,text/plain,*/*"
+          })
+
+          def get(session, label, url, through_proxy=True):
+            client = session if through_proxy else requests.Session()
+            if not through_proxy:
+              client.trust_env = False
+            try:
+              start = time.monotonic()
+              r = client.get(url, timeout=(5, 10), allow_redirects=False)
+              elapsed = round((time.monotonic()-start)*1000)
+              out = {"status": r.status_code, "ms": elapsed}
+              if label in ("ipify", "checkip", "ipinfo_ip", "ifconfig", "icanhazip"):
+                out["ip"] = (r.json().get("ip") if label=="ipify" and r.status_code==200 else r.text.strip()) if r.status_code==200 else None
+              if label.startswith("ramzinex_") and r.status_code==200:
+                try:
+                  d=r.json()
+                  out["json"]=isinstance(d,(dict,list))
+                  if isinstance(d,dict):
+                    out["keys"]=list(d.keys())[:10]
+                    data=d.get("data")
+                    if isinstance(data,list): out["items"]=len(data)
+                    elif isinstance(data,dict): out["data_keys"]=list(data.keys())[:10]
+                except Exception:
+                  out["json"]=False
+              return out
+            except Exception as e:
+              return {"error":type(e).__name__,"detail":str(e)[:200]}
+            finally:
+              if not through_proxy:
+                client.close()
+
+          out={"proxy":PROXY,"proxy_ip_echo":{},"geolocation":{},"ramzinex":{}}
+          echo={
+            "ipify":"https://api.ipify.org?format=json",
+            "checkip":"https://checkip.amazonaws.com/",
+            "ipinfo_ip":"https://ipinfo.io/ip",
+            "ifconfig":"https://ifconfig.me/ip",
+            "icanhazip":"https://icanhazip.com/",
+          }
+          discovered=[]
+          for label,url in echo.items():
+            v=get(s,label,url,True)
+            out["proxy_ip_echo"][label]=v
+            ip=v.get("ip")
+            if ip and ip not in discovered: discovered.append(ip)
+
+          # Resolve location independently from the runner using each observed exit IP.
+          for ip in discovered:
+            item={}
+            item["ipapi"]=get(s,"geo",f"https://ipapi.co/{ip}/json/",False)
+            item["ipwhois"]=get(s,"geo",f"https://ipwho.is/{ip}",False)
+            item["ip_api"]=get(s,"geo",f"http://ip-api.com/json/{ip}?fields=status,countryCode,regionName,city,isp,as,query",False)
+            out["geolocation"][ip]=item
+
+          targets={
+            "pairs":"https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/pairs",
+            "pair_2":"https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/pairs/2",
+            "orderbook_2":"https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/orderbooks/2/buys_sells",
+            "all_orderbooks":"https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/orderbooks/buys_sells",
+            "prices":"https://publicapi.ramzinex.com/exchange/api/exchange/prices",
+          }
+          for label,url in targets.items():
+            out["ramzinex"][label]=get(s,"ramzinex_"+label,url,True)
+
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          ir=[]
+          for ip, providers in out["geolocation"].items():
+            for provider, result in providers.items():
+              country = result.get("json",{}).get("country_code") or result.get("json",{}).get("country") or result.get("json",{}).get("countryCode")
+              # get() helper returns wrapper; parse service-specific structures below.
+              raw = result
+              if provider=="ipapi" and raw.get("status")==200:
+                country = raw.get("country")
+              elif provider=="ipwhois" and raw.get("status")==200:
+                country = raw.get("country")
+              elif provider=="ip_api" and raw.get("status")==200:
+                country = raw.get("country")
+              if country:
+                ir.append((ip,provider,country))
+          pairs_ok=out["ramzinex"].get("pairs",{}).get("status")==200
+          orderbook_ok=out["ramzinex"].get("orderbook_2",{}).get("status")==200
+          print("\nSUMMARY:",json.dumps({
+            "observed_ips":discovered,
+            "geoip_votes":ir,
+            "ramzinex_pairs_200":pairs_ok,
+            "ramzinex_orderbook_2_200":orderbook_ok,
+            "prices_status":out["ramzinex"].get("prices",{}).get("status"),
+          },ensure_ascii=False))
+          Path("ramzinex-proxy-final-results.json").write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding="utf-8")
+          s.close()
+          PY
+      - name: Upload final verification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramzinex-proxy-final-verification
+          path: ramzinex-proxy-final-results.json
+          if-no-files-found: ignore
+          retention-days: 3
