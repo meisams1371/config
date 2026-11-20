@@ -109,8 +109,10 @@ def _proxy_is_valid() -> bool:
 
 
 def _require_config() -> None:
-    if not TOKEN or len(TOKEN) < 32 or not _proxy_is_valid():
-        raise HTTPException(status_code=503, detail="Ramzinex relay is not configured")
+    # The proxy is selected and verified at runtime. Only the relay token is a
+    # mandatory deployment secret; RAMZINEX_UPSTREAM_PROXY is an optional pin.
+    if not TOKEN or len(TOKEN) < 32:
+        raise HTTPException(status_code=503, detail="Ramzinex relay token is not configured")
 
 
 def _authorize(request: Request) -> None:
@@ -176,35 +178,64 @@ def _upstream_path(path: str) -> str:
 
 async def _fetch_upstream(path: str, params: dict[str, str] | None = None) -> tuple[int, bytes, dict[str, str]]:
     target = BASE + _upstream_path(path)
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(
-                proxies=UPSTREAM_PROXY,
-                timeout=TIMEOUT,
-                follow_redirects=False,
-                trust_env=False,
-                limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
-                headers={
-                    "User-Agent": "X4G-Ramzinex-ReadOnlyRelay/1.0",
-                    "Accept": "application/json",
-                },
-            ) as client:
-                async with client.stream("GET", target, params=params or {}) as upstream:
-                    body = await upstream.aread()
-                    if len(body) > MAX_RESPONSE_BYTES:
-                        raise HTTPException(status_code=502, detail="Upstream response exceeded size limit")
-                    headers = {}
-                    for name in ("content-type", "cache-control", "etag", "last-modified"):
-                        value = upstream.headers.get(name)
-                        if value:
-                            headers[name] = value
-                    return upstream.status_code, body, headers
-        except httpx.RequestError:
-            if attempt >= 2:
-                raise
-            # The tested public Iran proxy has occasional transient connection
-            # failures, so retry the read-only request twice before giving up.
-            await asyncio.sleep(0.4 * (attempt + 1))
+    last_error: Exception | None = None
+
+    # One full retry cycle is allowed after refreshing the route list. Requests
+    # remain GET-only and can safely move to another verified public egress.
+    for cycle in range(2):
+        proxy_urls = await _get_ramzinex_proxy_urls(force_refresh=(cycle > 0))
+        if not proxy_urls:
+            break
+
+        for proxy_url in proxy_urls:
+            route_failed = False
+            for attempt in range(2):
+                try:
+                    async with httpx.AsyncClient(
+                        proxies=proxy_url,
+                        timeout=TIMEOUT,
+                        follow_redirects=False,
+                        trust_env=False,
+                        limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+                        headers={
+                            "User-Agent": "X4G-Ramzinex-ReadOnlyRelay/1.0",
+                            "Accept": "application/json",
+                        },
+                    ) as client:
+                        async with client.stream("GET", target, params=params or {}) as upstream:
+                            if upstream.status_code in (403, 407, 429) or upstream.status_code >= 500:
+                                last_error = httpx.ConnectError(
+                                    f"Verified route returned upstream HTTP {upstream.status_code}"
+                                )
+                                route_failed = True
+                                break
+                            body = await upstream.aread()
+                            if len(body) > MAX_RESPONSE_BYTES:
+                                raise HTTPException(status_code=502, detail="Upstream response exceeded size limit")
+                            headers = {}
+                            for name in ("content-type", "cache-control", "etag", "last-modified"):
+                                value = upstream.headers.get(name)
+                                if value:
+                                    headers[name] = value
+                            return upstream.status_code, body, headers
+                except HTTPException:
+                    raise
+                except httpx.RequestError as exc:
+                    last_error = exc
+                    if attempt == 0:
+                        await asyncio.sleep(0.35)
+                        continue
+                    route_failed = True
+
+            if route_failed:
+                await _mark_ramzinex_proxy_failed(proxy_url)
+
+    if last_error:
+        raise last_error
+    raise HTTPException(
+        status_code=503,
+        detail="No currently verified Iran egress route is available for Ramzinex",
+    )
 
 
 def _json_summary(name: str, status: int, body: bytes) -> dict:
@@ -701,6 +732,225 @@ async def scan_iran_proxies(force: bool = False) -> dict:
         return {**report, "cached": False}
 
 
+# ── Runtime self-healing Ramzinex egress pool ──────────────────────────────────
+# Public proxy lists are volatile. Keep a small pool of routes that have passed
+# three independent GeoIP checks plus live Ramzinex pairs/orderbook GETs.
+# A private, operator-supplied RAMZINEX_UPSTREAM_PROXY is optional and is tested
+# by the exact same checks; it is never trusted merely because it is configured.
+_RAMZINEX_PROXY_REFRESH_SECONDS = max(
+    180, min(3600, int(os.environ.get("RAMZINEX_PROXY_REFRESH_SECONDS", "600")))
+)
+_RAMZINEX_PROXY_POOL_SIZE = 5
+_ramzinex_proxy_urls: list[str] = []
+_ramzinex_proxy_checked_at = 0.0
+_ramzinex_proxy_status: dict = {
+    "state": "not_checked",
+    "verified_count": 0,
+    "checked_at": None,
+    "last_error": None,
+}
+_ramzinex_proxy_lock = asyncio.Lock()
+_ramzinex_proxy_task: asyncio.Task | None = None
+
+
+def _proxy_candidate_from_config(proxy_url: str) -> dict | None:
+    try:
+        parsed = urlsplit(proxy_url)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        return {
+            "proxy": proxy_url,
+            "ip": parsed.hostname,
+            "port": parsed.port,
+            "anonymity": "configured",
+            "listed_city": "configured",
+        }
+    except Exception:
+        return None
+
+
+def _set_ramzinex_proxy_status(state: str, verified_count: int, error: str | None = None) -> None:
+    _ramzinex_proxy_status.update({
+        "state": state,
+        "verified_count": verified_count,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "last_error": error,
+    })
+
+
+async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
+    """Refresh a short, verified failover pool without scanning unrelated protocols."""
+    global _ramzinex_proxy_urls, _ramzinex_proxy_checked_at
+    now = time.monotonic()
+    if (
+        not force
+        and _ramzinex_proxy_checked_at
+        and now - _ramzinex_proxy_checked_at < _RAMZINEX_PROXY_REFRESH_SECONDS
+    ):
+        return {**_ramzinex_proxy_status, "cached": True}
+
+    async with _ramzinex_proxy_lock:
+        now = time.monotonic()
+        if (
+            not force
+            and _ramzinex_proxy_checked_at
+            and now - _ramzinex_proxy_checked_at < _RAMZINEX_PROXY_REFRESH_SECONDS
+        ):
+            return {**_ramzinex_proxy_status, "cached": True}
+
+        candidates: list[dict] = []
+        configured = _proxy_candidate_from_config(UPSTREAM_PROXY) if UPSTREAM_PROXY else None
+        if configured:
+            candidates.append(configured)
+
+        source_error = None
+        async with httpx.AsyncClient(
+            timeout=_DIRECT_TIMEOUT,
+            follow_redirects=False,
+            trust_env=False,
+            headers={"User-Agent": "X4G-Ramzinex-AutoEgress/1.0", "Accept": "application/json"},
+        ) as direct_client:
+            try:
+                source_response = await direct_client.get(HTTP_PROXY_SOURCE, timeout=12.0)
+                source_response.raise_for_status()
+                candidates.extend(_http_proxy_candidates(source_response.json()))
+            except Exception as exc:
+                source_error = type(exc).__name__
+                logger.warning("Ramzinex auto-egress source fetch failed type=%s", source_error)
+
+            unique: dict[str, dict] = {}
+            for candidate in candidates:
+                unique.setdefault(candidate["proxy"], candidate)
+            candidates = list(unique.values())
+            semaphore = asyncio.Semaphore(6)
+
+            async def bounded(candidate: dict) -> dict:
+                async with semaphore:
+                    return await _test_http_proxy(candidate, direct_client)
+
+            rows = await asyncio.gather(*(bounded(candidate) for candidate in candidates))
+        
+        ready = [row for row in rows if row.get("ramzinex_ready") is True and row.get("geoip", {}).get("iran_confirmed") is True]
+        ready.sort(key=lambda row: (
+            row.get("proxy") != UPSTREAM_PROXY,
+            row.get("latency_ms", 999999),
+        ))
+        selected = ready[:_RAMZINEX_PROXY_POOL_SIZE]
+        _ramzinex_proxy_urls = [str(row["proxy"]) for row in selected]
+        _ramzinex_proxy_checked_at = time.monotonic()
+
+        if selected:
+            state = "configured_and_discovered" if any(
+                row.get("proxy") == UPSTREAM_PROXY for row in selected
+            ) and len(selected) > 1 else (
+                "configured" if selected[0].get("proxy") == UPSTREAM_PROXY else "discovered"
+            )
+            _set_ramzinex_proxy_status(state, len(selected), None)
+            logger.info("Ramzinex egress pool refreshed: %s verified route(s)", len(selected))
+        else:
+            _set_ramzinex_proxy_status(
+                "unavailable",
+                0,
+                "no_iran_proxy_passed_geoip_and_ramzinex_get_checks"
+                + (f";source={source_error}" if source_error else ""),
+            )
+            logger.warning("Ramzinex egress pool refresh found no verified route")
+
+        return {**_ramzinex_proxy_status, "cached": False}
+
+
+async def _get_ramzinex_proxy_urls(force_refresh: bool = False) -> list[str]:
+    now = time.monotonic()
+    expired = (
+        not _ramzinex_proxy_checked_at
+        or now - _ramzinex_proxy_checked_at >= _RAMZINEX_PROXY_REFRESH_SECONDS
+    )
+    if force_refresh or expired or not _ramzinex_proxy_urls:
+        await refresh_ramzinex_proxy_pool(force=True)
+    return list(_ramzinex_proxy_urls)
+
+
+async def _mark_ramzinex_proxy_failed(proxy_url: str) -> None:
+    global _ramzinex_proxy_urls, _ramzinex_proxy_checked_at
+    async with _ramzinex_proxy_lock:
+        if proxy_url in _ramzinex_proxy_urls:
+            _ramzinex_proxy_urls = [item for item in _ramzinex_proxy_urls if item != proxy_url]
+        _ramzinex_proxy_checked_at = 0.0
+        _set_ramzinex_proxy_status(
+            "degraded" if _ramzinex_proxy_urls else "unavailable",
+            len(_ramzinex_proxy_urls),
+            "a_previously_verified_route_failed",
+        )
+
+
+async def _ramzinex_proxy_maintenance_loop() -> None:
+    while True:
+        try:
+            await refresh_ramzinex_proxy_pool(force=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Ramzinex proxy maintenance failed type=%s", type(exc).__name__)
+            _set_ramzinex_proxy_status("unavailable", len(_ramzinex_proxy_urls), type(exc).__name__)
+        await asyncio.sleep(_RAMZINEX_PROXY_REFRESH_SECONDS)
+
+
+async def start_proxy_manager() -> None:
+    """Start periodic route discovery from the parent X4G FastAPI lifecycle."""
+    global _ramzinex_proxy_task
+    if _ramzinex_proxy_task is None or _ramzinex_proxy_task.done():
+        _ramzinex_proxy_task = asyncio.create_task(
+            _ramzinex_proxy_maintenance_loop(),
+            name="ramzinex-proxy-maintenance",
+        )
+
+
+async def stop_proxy_manager() -> None:
+    global _ramzinex_proxy_task
+    task = _ramzinex_proxy_task
+    _ramzinex_proxy_task = None
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _get_egress_ip_via_pool() -> dict:
+    last_error = None
+    for cycle in range(2):
+        proxy_urls = await _get_ramzinex_proxy_urls(force_refresh=(cycle > 0))
+        for proxy_url in proxy_urls:
+            try:
+                async with httpx.AsyncClient(
+                    proxies=proxy_url,
+                    timeout=TIMEOUT,
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as client:
+                    response = await client.get(IP_ECHO_URL)
+                    if response.status_code == 200:
+                        payload = response.json()
+                        return {
+                            "http_status": response.status_code,
+                            "ip": payload.get("ip") if isinstance(payload, dict) else None,
+                        }
+                    last_error = httpx.ConnectError(f"IP echo returned HTTP {response.status_code}")
+            except httpx.RequestError as exc:
+                last_error = exc
+            await _mark_ramzinex_proxy_failed(proxy_url)
+    if last_error:
+        raise last_error
+    raise HTTPException(status_code=503, detail="No verified Iran egress route is available")
+
+
 async def build_daily_proxy_report(force: bool = False) -> str:
     report = await scan_iran_proxies(force=force)
     checked = report.get("checked_at", "")
@@ -790,8 +1040,16 @@ async def health() -> dict:
         "ok": True,
         "service": "x4g-ramzinex-readonly-relay",
         "upstream_proxy_configured": _proxy_is_valid(),
+        "upstream_proxy_ready": bool(_ramzinex_proxy_urls),
+        "proxy_pool": {
+            "state": _ramzinex_proxy_status.get("state"),
+            "verified_count": len(_ramzinex_proxy_urls),
+            "checked_at": _ramzinex_proxy_status.get("checked_at"),
+            "last_error": _ramzinex_proxy_status.get("last_error"),
+            "refresh_seconds": _RAMZINEX_PROXY_REFRESH_SECONDS,
+        },
         "relay_token_configured": len(TOKEN) >= 32,
-        "mode": "GET-only, allow-listed",
+        "mode": "read-only, allow-listed, auto-failover",
     }
 
 
@@ -901,9 +1159,50 @@ async def _ws_upstream_to_client(websocket: WebSocket, upstream) -> None:
             await websocket.send_bytes(message)
 
 
+async def _run_public_ws_tunnel(websocket: WebSocket, proxy_url: str) -> str:
+    async with websockets.connect(
+        WS_ENDPOINT,
+        proxy=proxy_url,
+        subprotocols=["centrifuge-json"],
+        open_timeout=12,
+        close_timeout=4,
+        ping_interval=20,
+        ping_timeout=20,
+        max_size=WS_MAX_MESSAGE_BYTES,
+        compression=None,
+    ) as upstream:
+        if upstream.subprotocol != "centrifuge-json":
+            raise RuntimeError("Ramzinex did not negotiate centrifuge-json")
+        await websocket.accept(subprotocol="centrifuge-json")
+        client_task = asyncio.create_task(_ws_client_to_upstream(websocket, upstream))
+        upstream_task = asyncio.create_task(_ws_upstream_to_client(websocket, upstream))
+        tasks = {client_task, upstream_task}
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        if upstream_task in done:
+            error = upstream_task.exception()
+            if error:
+                raise error
+            return "upstream_closed"
+
+        if client_task in done:
+            error = client_task.exception()
+            if error:
+                raise error
+            return "client_closed"
+
+        return "closed"
+
+
 @app.websocket("/ws")
 async def ramzinex_public_websocket(websocket: WebSocket):
-    """Authenticated, read-only Centrifuge WebSocket tunnel to Ramzinex."""
+    """Authenticated, read-only Centrifuge tunnel with verified proxy failover."""
     supplied = websocket.headers.get("x-relay-token", "")
     if not _valid_ws_token(supplied):
         await websocket.close(code=1008)
@@ -920,46 +1219,44 @@ async def ramzinex_public_websocket(websocket: WebSocket):
         await websocket.close(code=1013)
         return
 
-    accepted = False
     try:
-        async with websockets.connect(
-            WS_ENDPOINT,
-            proxy=UPSTREAM_PROXY,
-            subprotocols=["centrifuge-json"],
-            open_timeout=12,
-            close_timeout=4,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=WS_MAX_MESSAGE_BYTES,
-            compression=None,
-        ) as upstream:
-            if upstream.subprotocol != "centrifuge-json":
-                await websocket.close(code=1011)
-                return
-            await websocket.accept(subprotocol="centrifuge-json")
-            accepted = True
-            client_task = asyncio.create_task(_ws_client_to_upstream(websocket, upstream))
-            upstream_task = asyncio.create_task(_ws_upstream_to_client(websocket, upstream))
-            tasks = {client_task, upstream_task}
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                error = task.exception()
-                if error and not isinstance(error, WebSocketDisconnect):
-                    raise error
-            if websocket.client_state == WebSocketState.CONNECTED and websocket.application_state == WebSocketState.CONNECTED:
-                await websocket.close(code=1000)
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:
-        logger.warning("Ramzinex WebSocket relay failed type=%s", type(exc).__name__)
-        if accepted and websocket.application_state == WebSocketState.CONNECTED:
-            try:
-                await websocket.close(code=1011, reason="upstream unavailable")
-            except Exception:
-                pass
+        # If a route dies between scheduled scans, mark it bad and try the next.
+        # If every route fails, force one fresh discovery before refusing service.
+        for cycle in range(2):
+            proxy_urls = await _get_ramzinex_proxy_urls(force_refresh=(cycle > 0))
+            if not proxy_urls:
+                break
+            for proxy_url in proxy_urls:
+                try:
+                    outcome = await _run_public_ws_tunnel(websocket, proxy_url)
+                    if outcome == "upstream_closed":
+                        await _mark_ramzinex_proxy_failed(proxy_url)
+                        if (
+                            websocket.client_state == WebSocketState.CONNECTED
+                            and websocket.application_state == WebSocketState.CONNECTED
+                        ):
+                            await websocket.close(code=1011, reason="upstream reconnect required")
+                    return
+                except WebSocketDisconnect:
+                    return
+                except Exception as exc:
+                    # A handshake error is safe to fail over before accepting the
+                    # downstream socket. After accept, the client must reconnect.
+                    await _mark_ramzinex_proxy_failed(proxy_url)
+                    logger.warning(
+                        "Ramzinex WebSocket route failed type=%s accepted=%s",
+                        type(exc).__name__,
+                        websocket.application_state == WebSocketState.CONNECTED,
+                    )
+                    if websocket.application_state == WebSocketState.CONNECTED:
+                        try:
+                            await websocket.close(code=1011, reason="upstream unavailable; reconnect")
+                        except Exception:
+                            pass
+                        return
+
+        if websocket.application_state != WebSocketState.CONNECTED:
+            await websocket.close(code=1013, reason="no verified Ramzinex egress route")
     finally:
         await _ws_connection_release(client_ip)
 
@@ -1038,18 +1335,7 @@ async def probe(request: Request):
             results.append({"name": "currencies", "error": type(exc).__name__})
 
         try:
-            async with httpx.AsyncClient(
-                proxies=UPSTREAM_PROXY,
-                timeout=TIMEOUT,
-                follow_redirects=False,
-                trust_env=False,
-            ) as client:
-                response = await client.get("https://api.ipify.org?format=json")
-                ip_data = response.json() if response.status_code == 200 else {}
-                egress = {
-                    "http_status": response.status_code,
-                    "ip": ip_data.get("ip") if isinstance(ip_data, dict) else None,
-                }
+            egress = await _get_egress_ip_via_pool()
         except Exception as exc:
             egress = {"error": type(exc).__name__}
 
@@ -1085,15 +1371,11 @@ async def egress(request: Request):
     _authorize(request)
     await _rate_check(request)
     try:
-        async with httpx.AsyncClient(
-            proxies=UPSTREAM_PROXY,
-            timeout=TIMEOUT,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await client.get("https://api.ipify.org?format=json")
-            return {"http_status": response.status_code, "body": response.json() if response.status_code == 200 else None}
+        return await _get_egress_ip_via_pool()
+    except HTTPException:
+        raise
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Egress IP lookup timed out")
     except httpx.RequestError:
         raise HTTPException(status_code=502, detail="Egress IP lookup failed")
+
