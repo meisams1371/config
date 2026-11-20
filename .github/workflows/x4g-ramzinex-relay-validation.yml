@@ -92,5 +92,74 @@ jobs:
               '{"connect":{"name":"js","token":"private-token"},"id":6}'
           )
 
-          print("relay syntax, guardrail, and read-only WebSocket tests passed")
+          # Exercise the actual ASGI WebSocket bridge with a mocked upstream.
+          import asyncio
+          from unittest.mock import patch
+
+          fake_upstreams = []
+
+          class FakeUpstream:
+              subprotocol = "centrifuge-json"
+
+              def __init__(self):
+                  self.sent = []
+                  self.queue = asyncio.Queue()
+
+              async def __aenter__(self):
+                  return self
+
+              async def __aexit__(self, exc_type, exc, tb):
+                  await self.queue.put(None)
+
+              async def send(self, message):
+                  self.sent.append(message)
+                  await self.queue.put(message)
+
+              def __aiter__(self):
+                  return self
+
+              async def __anext__(self):
+                  message = await self.queue.get()
+                  if message is None:
+                      raise StopAsyncIteration
+                  return message
+
+          def fake_connect(*args, **kwargs):
+              assert args[0] == relay_app.WS_ENDPOINT
+              assert kwargs.get("subprotocols") == ["centrifuge-json"]
+              assert kwargs.get("proxy") == relay_app.UPSTREAM_PROXY
+              upstream = FakeUpstream()
+              fake_upstreams.append(upstream)
+              return upstream
+
+          connect_frame = '{"connect":{"name":"js"},"id":1}'
+          subscribe_frame = '{"subscribe":{"channel":"orderbook:11","recover":true},"id":2}'
+          with patch.object(relay_app.websockets, "connect", side_effect=fake_connect):
+              with client.websocket_connect(
+                  "/ws", headers={"X-Relay-Token": relay_app.TOKEN}
+              ) as ws:
+                  ws.send_text(connect_frame)
+                  assert ws.receive_text() == connect_frame
+                  ws.send_text(subscribe_frame)
+                  assert ws.receive_text() == subscribe_frame
+
+          assert len(fake_upstreams) == 1
+          assert fake_upstreams[0].sent == [connect_frame, subscribe_frame]
+          assert relay_app._ws_active_total == 0
+
+          # Forbidden publish commands must close the tunnel without reaching upstream.
+          fake_upstreams.clear()
+          with patch.object(relay_app.websockets, "connect", side_effect=fake_connect):
+              with client.websocket_connect(
+                  "/ws", headers={"X-Relay-Token": relay_app.TOKEN}
+              ) as ws:
+                  ws.send_text('{"publish":{"channel":"orderbook:11","data":{}},"id":3}')
+                  closed = ws.receive()
+                  assert closed["type"] == "websocket.disconnect", closed
+                  assert closed.get("code") == 1008, closed
+          assert len(fake_upstreams) == 1
+          assert fake_upstreams[0].sent == []
+          assert relay_app._ws_active_total == 0
+
+          print("relay syntax, guardrail, and bidirectional WebSocket tests passed")
           PY
