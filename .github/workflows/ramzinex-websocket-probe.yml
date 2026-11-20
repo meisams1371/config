@@ -1,0 +1,167 @@
+name: Ramzinex WebSocket capability probe
+
+on:
+  push:
+    branches:
+      - ramzinex-ws-probe
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install WebSocket probe client
+        run: python -m pip install --disable-pip-version-check websockets==12.0
+      - name: Discover public WebSocket endpoints and test handshake
+        run: |
+          cat > probe.py <<'PY'
+          import asyncio
+          import json
+          import re
+          from html.parser import HTMLParser
+          from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qs, urlencode
+          from urllib.request import Request, urlopen
+          import websockets
+
+          ROOTS = [
+              "https://ramzinex.com/",
+              "https://ramzinex.com/exchange/apidocs/apidoc.html",
+              "https://publicapi.ramzinex.com/",
+          ]
+          UA = "Mozilla/5.0 (compatible; RamzinexPublicWSProbe/1.0)"
+          class Scripts(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.items = []
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() == "script":
+                      src = dict(attrs).get("src")
+                      if src:
+                          self.items.append(src)
+
+          def get(url, limit=2_500_000):
+              req = Request(url, headers={"User-Agent": UA, "Accept": "text/html,application/javascript,*/*"})
+              with urlopen(req, timeout=12) as r:
+                  data = r.read(limit + 1)
+                  return r.geturl(), data[:limit].decode("utf-8", "replace"), r.status
+
+          def safe_url(raw):
+              p = urlsplit(raw)
+              return urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+
+          def main_sync():
+              pages, assets, errors = [], set(), []
+              for root in ROOTS:
+                  try:
+                      final, body, status = get(root)
+                      pages.append({"url": final, "status": status, "bytes": len(body)})
+                      parser = Scripts()
+                      parser.feed(body)
+                      for src in parser.items[:80]:
+                          assets.add(urljoin(final, src))
+                      # Discover explicit WebSocket URLs in HTML too.
+                      for m in re.findall(r"""wss?://[^\s"'<>\\)]+""", body, re.I):
+                          assets.add("ENDPOINT:" + m.rstrip(";,"))
+                  except Exception as e:
+                      errors.append({"url": root, "error": type(e).__name__ + ": " + str(e)[:180]})
+              snippets = []
+              full_endpoints = set()
+              socketio_hints = False
+              plain_ws_hints = False
+              relevant_assets = []
+              for asset in sorted(assets):
+                  if asset.startswith("ENDPOINT:"):
+                      full_endpoints.add(asset[len("ENDPOINT:"):])
+                      continue
+                  try:
+                      _, js, _ = get(asset, limit=2_500_000)
+                  except Exception:
+                      continue
+                  lower = js.lower()
+                  if any(k in lower for k in ("websocket", "socket.io", "socketio", "centrifuge", "sockjs", "signalr", "wss://", "ws://")):
+                      relevant_assets.append(asset)
+                      socketio_hints |= ("socket.io" in lower or "socketio" in lower or "engine.io" in lower)
+                      plain_ws_hints |= ("new websocket" in lower or "websocket(" in lower or "wss://" in lower or "ws://" in lower)
+                      for m in re.findall(r"""wss?://[^\s"'<>\\)]+""", js, re.I):
+                          full_endpoints.add(m.rstrip(";,"))
+                      for keyword in ("socket.io", "websocket", "centrifuge", "sockjs", "signalr"):
+                          pos = lower.find(keyword)
+                          if pos >= 0:
+                              snippets.append({"asset": asset, "keyword": keyword, "context": js[max(0,pos-90):pos+180].replace("\n"," ")[:270]})
+                              break
+              return pages, sorted(full_endpoints), socketio_hints, plain_ws_hints, relevant_assets[:15], snippets[:12], errors
+
+          async def test_endpoint(raw):
+              # Never print token-like query values. For testing, retain only protocol parameters.
+              p = urlsplit(raw.strip().rstrip(".,;"))
+              if p.scheme not in ("ws", "wss") or not p.netloc:
+                  return {"endpoint": raw[:160], "result": "invalid candidate"}
+              base = safe_url(raw)
+              is_socketio = "socket.io" in p.path.lower()
+              queries = [p.query] if p.query else [""]
+              if is_socketio and not p.query:
+                  queries = ["EIO=4&transport=websocket", "EIO=3&transport=websocket"]
+              attempts = []
+              for query in queries[:2]:
+                  target = urlunsplit((p.scheme, p.netloc, p.path or "/", query, ""))
+                  try:
+                      async with websockets.connect(target, open_timeout=7, close_timeout=1, ping_interval=None, max_size=1_000_000) as ws:
+                          item = {"endpoint": base, "transport_handshake": "success"}
+                          if is_socketio:
+                              await ws.send("40")
+                              try:
+                                  msg = await asyncio.wait_for(ws.recv(), timeout=4)
+                                  item["socketio_namespace"] = "response received"
+                                  item["response_prefix"] = str(msg)[:180]
+                              except asyncio.TimeoutError:
+                                  item["socketio_namespace"] = "no namespace response within 4s"
+                          else:
+                              try:
+                                  msg = await asyncio.wait_for(ws.recv(), timeout=4)
+                                  item["first_message"] = str(msg)[:180]
+                                  item["message_received"] = True
+                              except asyncio.TimeoutError:
+                                  item["message_received"] = False
+                                  item["note"] = "Handshake succeeded; no data without a documented subscription message."
+                          attempts.append(item)
+                          break
+                  except Exception as e:
+                      attempts.append({"endpoint": base, "transport_handshake": "failed", "error": type(e).__name__ + ": " + str(e)[:180]})
+              return attempts[-1] if attempts else {"endpoint":base,"transport_handshake":"not tested"}
+
+          async def main():
+              pages, endpoints, socketio_hints, plain_ws_hints, assets, snippets, errors = main_sync()
+              # If the public frontend imports Socket.IO but does not embed an absolute URL,
+              # test its same-origin default path as a discovery probe only.
+              if socketio_hints and not endpoints:
+                  endpoints = ["wss://ramzinex.com/socket.io/"]
+              tests = []
+              for endpoint in endpoints[:12]:
+                  tests.append(await test_endpoint(endpoint))
+              rest = {}
+              try:
+                  final, body, status = get("https://publicapi.ramzinex.com/exchange/api/v1.0/exchange/pairs", limit=600_000)
+                  rest = {"pairs_http_status": status, "response_bytes": len(body), "json_like": body.lstrip().startswith(("{","["))}
+              except Exception as e:
+                  rest = {"pairs_error": type(e).__name__ + ": " + str(e)[:180]}
+              print(json.dumps({
+                  "pages": pages,
+                  "public_rest_control": rest,
+                  "explicit_ws_endpoints_found": endpoints,
+                  "protocol_hints": {"socketio": socketio_hints, "plain_websocket": plain_ws_hints},
+                  "websocket_tests": tests,
+                  "relevant_frontend_assets": assets,
+                  "frontend_evidence_snippets": snippets,
+                  "fetch_errors": errors,
+                  "interpretation": "A successful TCP/WebSocket handshake alone does not prove that public market subscriptions exist. A valid market subscription plus actual market messages is required."
+              }, ensure_ascii=False, indent=2))
+          asyncio.run(main())
+          PY
+          python probe.py
