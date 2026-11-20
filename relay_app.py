@@ -874,7 +874,7 @@ async def _get_ramzinex_proxy_urls(force_refresh: bool = False) -> list[str]:
         not _ramzinex_proxy_checked_at
         or now - _ramzinex_proxy_checked_at >= _RAMZINEX_PROXY_REFRESH_SECONDS
     )
-    if force_refresh or expired or not _ramzinex_proxy_urls:
+    if force_refresh or expired:
         await refresh_ramzinex_proxy_pool(force=True)
     return list(_ramzinex_proxy_urls)
 
