@@ -39,7 +39,7 @@ jobs:
                   print("::add-mask::" + proxy)
               if valid:
                   with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
-                      env.write("RAMZINEX_WS_HTTP_PROXIES=" + ",".join(valid) + "\\n")
+                      env.write("RAMZINEX_WS_HTTP_PROXIES=" + ",".join(valid) + "\n")
 
               safe_report = {
                   "checked_at": report.get("checked_at"),
