@@ -50,6 +50,12 @@ jobs:
               out = {"status": r.status_code, "ms": elapsed}
               if label in ("ipify", "checkip", "ipinfo_ip", "ifconfig", "icanhazip"):
                 out["ip"] = (r.json().get("ip") if label=="ipify" and r.status_code==200 else r.text.strip()) if r.status_code==200 else None
+              if label == "geo" and r.status_code==200:
+                try:
+                  d=r.json()
+                  out["data"]={k:d.get(k) for k in ("ip","country","country_code","countryCode","country_name","region","regionName","city","org","isp","as","success")}
+                except Exception:
+                  out["json"]=False
               if label.startswith("ramzinex_") and r.status_code==200:
                 try:
                   d=r.json()
@@ -105,15 +111,10 @@ jobs:
           ir=[]
           for ip, providers in out["geolocation"].items():
             for provider, result in providers.items():
-              country = result.get("json",{}).get("country_code") or result.get("json",{}).get("country") or result.get("json",{}).get("countryCode")
-              # get() helper returns wrapper; parse service-specific structures below.
-              raw = result
-              if provider=="ipapi" and raw.get("status")==200:
-                country = raw.get("country")
-              elif provider=="ipwhois" and raw.get("status")==200:
-                country = raw.get("country")
-              elif provider=="ip_api" and raw.get("status")==200:
-                country = raw.get("country")
+              country = (result.get("data",{}).get("country_code") or
+                         result.get("data",{}).get("countryCode") or
+                         result.get("data",{}).get("country") or
+                         result.get("data",{}).get("country_name"))
               if country:
                 ir.append((ip,provider,country))
           pairs_ok=out["ramzinex"].get("pairs",{}).get("status")==200
