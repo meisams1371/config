@@ -878,6 +878,9 @@ _RAMZINEX_PROXY_STARTUP_TIMEOUT = max(
     30, min(180, int(os.environ.get("RAMZINEX_PROXY_STARTUP_TIMEOUT", "150")))
 )
 _RAMZINEX_PROXY_POOL_SIZE = 5
+_RAMZINEX_PROXY_RETRY_SECONDS = max(
+    15, min(300, int(os.environ.get("RAMZINEX_PROXY_RETRY_SECONDS", "60")))
+)
 _RAMZINEX_HTTP_VERIFY_LIMIT = max(
     12, min(64, int(os.environ.get("RAMZINEX_HTTP_VERIFY_LIMIT", "48")))
 )
@@ -1118,7 +1121,10 @@ async def _mark_ramzinex_proxy_failed(proxy_url: str) -> None:
 
 async def _ramzinex_proxy_maintenance_loop() -> None:
     while True:
-        await asyncio.sleep(_RAMZINEX_PROXY_REFRESH_SECONDS)
+        # Retry quickly while no Iranian WebSocket route exists; once the pool
+        # is healthy, return to the normal 10-minute refresh cadence.
+        delay = _RAMZINEX_PROXY_REFRESH_SECONDS if _ramzinex_proxy_urls else _RAMZINEX_PROXY_RETRY_SECONDS
+        await asyncio.sleep(delay)
         try:
             await refresh_ramzinex_proxy_pool(force=True)
         except asyncio.CancelledError:
