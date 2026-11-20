@@ -446,6 +446,7 @@ async def _test_http_proxy(candidate: dict, direct_client: httpx.AsyncClient) ->
             **result,
             "status": "connection_failed",
             "error": type(exc).__name__,
+            "detail": str(exc)[:180],
             "latency_ms": round((time.monotonic() - started) * 1000),
         }
 
@@ -588,6 +589,23 @@ async def scan_iran_proxies(force: bool = False) -> dict:
             "source_mtproto": MTPROTO_SOURCE,
             "http_candidates": len(candidates),
             "http_tested": len(http_results),
+            "http_diagnostics": [
+                {
+                    "proxy": row.get("proxy"),
+                    "status": row.get("status"),
+                    "error": row.get("error"),
+                    "detail": row.get("detail"),
+                    "exit_ip": row.get("exit_ip"),
+                    "geoip_votes": {
+                        name: value.get("country")
+                        for name, value in row.get("geoip", {}).get("votes", {}).items()
+                    },
+                    "pairs_status": row.get("pairs_status"),
+                    "orderbook_status": row.get("orderbook_status"),
+                    "latency_ms": row.get("latency_ms"),
+                }
+                for row in http_results
+            ],
             "iran_http_exits": iran_http,
             "ramzinex_ready": ramzinex_ready,
             "mtproto_iran_tcp": mtproto_results,
