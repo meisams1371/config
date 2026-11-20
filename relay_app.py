@@ -280,6 +280,11 @@ HTTP_PROXY_SOURCE = (
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/"
     "proxies/countries/IR/data.json"
 )
+# ProxySpace republishes country-specific HTTP and HTTPS proxy candidates every
+# 20 minutes. Its lists are explicitly untested; every candidate still passes
+# our own independent GeoIP, Ramzinex REST and Centrifuge WebSocket checks.
+PROXYSPACE_IR_HTTP_SOURCE = "https://proxyspace.pro/country/ir/http.txt"
+PROXYSPACE_IR_HTTPS_SOURCE = "https://proxyspace.pro/country/ir/https.txt"
 MTPROTO_SOURCE = (
     "https://raw.githubusercontent.com/Kolandone/v2raycollector/main/proxy.txt"
 )
@@ -406,6 +411,40 @@ def _http_proxy_candidates(payload: object) -> list[dict]:
         row["listed_city"] == "Unknown",
     ))
     return rows[:_HTTP_SCAN_LIMIT]
+
+
+def _proxyspace_candidates(http_text: str = "", https_text: str = "") -> list[dict]:
+    """Parse ProxySpace Iran HTTP/HTTPS candidate lists (ip:port, not pre-verified)."""
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for protocol_label, content in (("http", http_text), ("https", https_text)):
+        for raw in str(content or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or len(line) > 96:
+                continue
+            try:
+                ip, port_text = line.rsplit(":", 1)
+                address = ipaddress.ip_address(ip.strip())
+                port = int(port_text.strip())
+                if not address.is_global or not (1 <= port <= 65535):
+                    continue
+                # ProxySpace's examples use an HTTP proxy transport even for
+                # its HTTPS-capable list; the label means HTTPS destination support.
+                proxy_url = f"http://{address.compressed}:{port}"
+                if proxy_url in seen:
+                    continue
+                seen.add(proxy_url)
+                rows.append({
+                    "proxy": proxy_url,
+                    "ip": address.compressed,
+                    "port": port,
+                    "scheme": "http",
+                    "anonymity": f"proxyspace-{protocol_label}",
+                    "listed_city": "Iran-list-unverified",
+                })
+            except Exception:
+                continue
+    return rows
 
 
 async def _test_http_proxy(candidate: dict, direct_client: httpx.AsyncClient) -> dict:
@@ -835,8 +874,14 @@ async def scan_iran_proxies(force: bool = False) -> dict:
 _RAMZINEX_PROXY_REFRESH_SECONDS = max(
     180, min(3600, int(os.environ.get("RAMZINEX_PROXY_REFRESH_SECONDS", "600")))
 )
+_RAMZINEX_PROXY_STARTUP_TIMEOUT = max(
+    30, min(180, int(os.environ.get("RAMZINEX_PROXY_STARTUP_TIMEOUT", "150")))
+)
 _RAMZINEX_PROXY_POOL_SIZE = 5
-_RAMZINEX_WS_VERIFY_LIMIT = 12
+_RAMZINEX_HTTP_VERIFY_LIMIT = max(
+    12, min(64, int(os.environ.get("RAMZINEX_HTTP_VERIFY_LIMIT", "48")))
+)
+_RAMZINEX_WS_VERIFY_LIMIT = max(4, min(16, int(os.environ.get("RAMZINEX_WS_VERIFY_LIMIT", "12"))))
 # Previously verified public endpoints are treated only as candidates. They are
 # re-tested from scratch on every refresh and never trusted or used blindly.
 _RAMZINEX_LAST_KNOWN_PROXY_CANDIDATES = (
@@ -926,6 +971,7 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
                 candidates.append(candidate)
 
         source_error = None
+        proxyspace_errors: list[str] = []
         async with httpx.AsyncClient(
             timeout=_DIRECT_TIMEOUT,
             follow_redirects=False,
@@ -940,10 +986,41 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
                 source_error = type(exc).__name__
                 logger.warning("Ramzinex auto-egress source fetch failed type=%s", source_error)
 
+            async def fetch_proxyspace(url: str, label: str) -> list[dict]:
+                try:
+                    response = await direct_client.get(url, timeout=12.0)
+                    response.raise_for_status()
+                    return _proxyspace_candidates(
+                        response.text if label == "http" else "",
+                        response.text if label == "https" else "",
+                    )
+                except Exception as exc:
+                    proxyspace_errors.append(f"{label}:{type(exc).__name__}")
+                    logger.warning("ProxySpace %s candidate list unavailable type=%s", label, type(exc).__name__)
+                    return []
+
+            proxyspace_lists = await asyncio.gather(
+                fetch_proxyspace(PROXYSPACE_IR_HTTP_SOURCE, "http"),
+                fetch_proxyspace(PROXYSPACE_IR_HTTPS_SOURCE, "https"),
+            )
+            for rows_for_protocol in proxyspace_lists:
+                candidates.extend(rows_for_protocol)
+
             unique: dict[str, dict] = {}
             for candidate in candidates:
                 unique.setdefault(candidate["proxy"], candidate)
-            candidates = list(unique.values())
+            # Keep configured and previously successful candidates first, then
+            # recent country-filtered ProxySpace candidates, then Proxifly.
+            priority = {
+                "configured": 0,
+                "previously-verified-recheck": 1,
+                "proxyspace-http": 2,
+                "proxyspace-https": 3,
+            }
+            candidates = sorted(
+                unique.values(),
+                key=lambda row: priority.get(row.get("anonymity"), 4),
+            )[:_RAMZINEX_HTTP_VERIFY_LIMIT]
             semaphore = asyncio.Semaphore(6)
 
             async def bounded(candidate: dict) -> dict:
@@ -1010,6 +1087,8 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
             "websocket_tested_count": min(len(http_ready), _RAMZINEX_WS_VERIFY_LIMIT),
             "websocket_ready_count": len(ready),
         })
+        _ramzinex_proxy_status["proxyspace_source_errors"] = proxyspace_errors
+        _ramzinex_proxy_status["http_candidate_limit"] = _RAMZINEX_HTTP_VERIFY_LIMIT
         return {**_ramzinex_proxy_status, "cached": False}
 
 
@@ -1055,9 +1134,7 @@ async def start_proxy_manager() -> None:
     if _ramzinex_proxy_task is None or _ramzinex_proxy_task.done():
         # Complete one bounded initial scan before the application is marked ready.
         # This prevents the first WebSocket handshake from waiting behind a 30-60s scan.
-        startup_timeout = max(
-            20, min(120, int(os.environ.get("RAMZINEX_PROXY_STARTUP_TIMEOUT", "90")))
-        )
+        startup_timeout = _RAMZINEX_PROXY_STARTUP_TIMEOUT
         try:
             await asyncio.wait_for(
                 refresh_ramzinex_proxy_pool(force=False),
