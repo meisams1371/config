@@ -1,10 +1,20 @@
 import { Centrifuge } from 'centrifuge';
 import WebSocket from 'ws';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 
 const ENDPOINT = 'wss://websocket.ramzinex.ir/websocket';
 const CONNECT_TIMEOUT_MS = 15000;
 const SUBSCRIBE_TIMEOUT_MS = 10000;
 const PUBLICATION_WINDOW_MS = 8000;
+const HTTP_PROXY_URL = process.env.RAMZINEX_WS_HTTP_PROXY?.trim() || '';
+const proxyAgent = HTTP_PROXY_URL ? new HttpsProxyAgent(HTTP_PROXY_URL) : undefined;
+
+// Keep proxy credentials private: never print the proxy URL or agent options.
+class RamzinexWebSocket extends WebSocket {
+  constructor(address, protocols) {
+    super(address, protocols, proxyAgent ? { agent: proxyAgent } : {});
+  }
+}
 
 // Channels and delta handling follow the uploaded Ramzinex documentation.
 const CHANNELS = [
@@ -49,7 +59,7 @@ async function probeRawCentrifugeConnect() {
     };
     let settled = false;
     let timer;
-    const socket = new WebSocket(ENDPOINT, 'centrifuge-json', { handshakeTimeout: 7000 });
+    const socket = new RamzinexWebSocket(ENDPOINT, 'centrifuge-json', { handshakeTimeout: 7000 });
     const finish = () => {
       if (settled) return;
       settled = true;
@@ -117,6 +127,7 @@ const report = {
   checked_at: new Date().toISOString(),
   endpoint: ENDPOINT,
   sdk: 'centrifuge-js',
+  network_route: HTTP_PROXY_URL ? 'http-proxy-secret-configured' : 'direct',
   channels: {},
   connection: { connected: false, disconnected: [] },
   publication_window_ms: PUBLICATION_WINDOW_MS,
@@ -124,7 +135,7 @@ const report = {
 
 report.raw_protocol_probe = await probeRawCentrifugeConnect();
 
-const client = new Centrifuge(ENDPOINT, { websocket: WebSocket });
+const client = new Centrifuge(ENDPOINT, { websocket: RamzinexWebSocket });
 
 client.on('error', (ctx) => {
   const err = ctx && ctx.error || ctx;

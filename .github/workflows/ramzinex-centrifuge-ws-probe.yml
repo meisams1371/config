@@ -22,6 +22,8 @@ jobs:
         with:
           node-version: "22"
       - name: Install official Centrifuge SDK and Node WebSocket transport
-        run: npm install --no-save --no-package-lock centrifuge@5.3.4 ws@8.18.3
+        run: npm install --no-save --no-package-lock centrifuge@5.3.4 ws@8.18.3 https-proxy-agent@7.0.6
       - name: Connect, subscribe, and observe public market channels
+        env:
+          RAMZINEX_WS_HTTP_PROXY: ${{ secrets.RAMZINEX_WS_HTTP_PROXY }}
         run: node scripts/ramzinex-centrifuge-probe.mjs
