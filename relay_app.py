@@ -649,10 +649,12 @@ async def scan_iran_proxies(force: bool = False) -> dict:
 
         iran_http = [row for row in http_results if row.get("geoip", {}).get("iran_confirmed")]
         ramzinex_ready = [row for row in iran_http if row.get("ramzinex_ready")]
+        ready_sort = lambda row: row.get("latency_ms", 999999)
         iran_http.sort(key=lambda row: (
             not row.get("ramzinex_ready"),
-            row.get("latency_ms", 999999),
+            ready_sort(row),
         ))
+        ramzinex_ready.sort(key=ready_sort)
         report = {
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "source_http": HTTP_PROXY_SOURCE,
