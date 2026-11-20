@@ -7,6 +7,7 @@ on:
       - ramzinex-x4g-iran-egress
     paths:
       - "scripts/ramzinex-centrifuge-probe.mjs"
+      - "scripts/ramzinex-relay-live-smoke.py"
       - ".github/workflows/ramzinex-centrifuge-ws-probe.yml"
       - "relay_app.py"
       - "requirements.txt"
@@ -137,3 +138,7 @@ jobs:
         env:
           RAMZINEX_WS_HTTP_PROXY: ${{ secrets.RAMZINEX_WS_HTTP_PROXY }}
         run: node scripts/ramzinex-centrifuge-probe.mjs
+      - name: Run live read-only WebSocket smoke test through the Python relay
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: python scripts/ramzinex-relay-live-smoke.py
