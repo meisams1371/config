@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
-XRAY_VERSION = os.environ.get("X4G_XRAY_VERSION", "v26.11.9")
+XRAY_VERSION = os.environ.get("X4G_XRAY_VERSION", "v26.10.31")
 XRAY_RELEASE_BASE = f"https://github.com/XTLS/Xray-core/releases/download/{XRAY_VERSION}"
 DEFAULT_SOURCE_URLS = (
     "https://raw.githubusercontent.com/mmbateni/iran-intranet-access/main/outputs/ir_exit_configs.txt",
@@ -37,7 +37,7 @@ SOCKS_START_TIMEOUT = 10.0
 XRAY_ASSETS = {
     "x86_64": (
         "Xray-linux-64.zip",
-        "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82",
+        "e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214",
     ),
     "amd64": (
         "Xray-linux-64.zip",
@@ -45,7 +45,7 @@ XRAY_ASSETS = {
     ),
     "aarch64": (
         "Xray-linux-arm64-v8a.zip",
-        "64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be",
+        "1811c8f1da0c3b6dc707ebaf1c8390e987ba39859a8f0a7aadd8526157f2ec8d",
     ),
     "arm64": (
         "Xray-linux-arm64-v8a.zip",
@@ -138,11 +138,11 @@ def parse_vless_uri(uri: str) -> dict | None:
         network = _first(params, "type", "tcp").lower()
         if network in ("tcp", "raw"):
             network = "raw"
-        if network not in ("raw", "ws", "grpc", "httpupgrade"):
+        if network not in ("raw", "ws", "grpc", "httpupgrade", "xhttp"):
             # Unsupported transports are rejected rather than guessed.
             return None
         # Xray REALITY is supported only with RAW and gRPC in the pinned core.
-        if security == "reality" and network not in ("raw", "grpc"):
+        if security == "reality" and network not in ("raw", "grpc", "xhttp"):
             return None
 
         flow = _first(params, "flow")
@@ -158,6 +158,7 @@ def parse_vless_uri(uri: str) -> dict | None:
             "ws": "websocket",
             "grpc": "grpc",
             "httpupgrade": "httpupgrade",
+            "xhttp": "xhttp",
         }[network]
         stream: dict = {"method": method, "security": security}
         if security == "tls":
@@ -207,6 +208,24 @@ def parse_vless_uri(uri: str) -> dict | None:
                     return None
                 settings["host"] = host_header
             stream["httpupgradeSettings"] = settings
+        elif network == "xhttp":
+            settings = {"path": path, "mode": _first(params, "mode", "auto") or "auto"}
+            if settings["mode"] not in ("auto", "packet-up", "stream-up", "stream-one"):
+                return None
+            if host_header:
+                if len(host_header) > 253 or any(ch in host_header for ch in "\r\n"):
+                    return None
+                settings["host"] = host_header
+            stream["xhttpSettings"] = settings
+
+        vless_settings = {
+            "address": host,
+            "port": port,
+            "id": client_uuid,
+            "encryption": "none",
+        }
+        if flow:
+            vless_settings["flow"] = flow
 
         config = {
             "log": {"loglevel": "none"},
@@ -221,13 +240,7 @@ def parse_vless_uri(uri: str) -> dict | None:
             "outbounds": [{
                 "tag": "x4g-vless-out",
                 "protocol": "vless",
-                "settings": {
-                    "address": host,
-                    "port": port,
-                    "id": client_uuid,
-                    "encryption": "none",
-                    "flow": flow,
-                },
+                "settings": vless_settings,
                 "streamSettings": stream,
             }],
             "routing": {
