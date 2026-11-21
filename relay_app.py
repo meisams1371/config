@@ -35,6 +35,8 @@ from fastapi.responses import JSONResponse, Response
 from starlette.websockets import WebSocketState
 import websockets
 
+from vless_egress import manager as _vless_egress_manager
+
 logger = logging.getLogger("X4G.ramzinex_relay")
 
 app = FastAPI(
@@ -885,6 +887,7 @@ _RAMZINEX_HTTP_VERIFY_LIMIT = max(
     12, min(64, int(os.environ.get("RAMZINEX_HTTP_VERIFY_LIMIT", "48")))
 )
 _RAMZINEX_WS_VERIFY_LIMIT = max(4, min(16, int(os.environ.get("RAMZINEX_WS_VERIFY_LIMIT", "12"))))
+_RAMZINEX_VLESS_VERIFY_LIMIT = max(1, min(20, int(os.environ.get("RAMZINEX_VLESS_SCAN_LIMIT", "12"))))
 # Previously verified public endpoints are treated only as candidates. They are
 # re-tested from scratch on every refresh and never trusted or used blindly.
 _RAMZINEX_LAST_KNOWN_PROXY_CANDIDATES = (
@@ -975,12 +978,51 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
 
         source_error = None
         proxyspace_errors: list[str] = []
+        vless_rows: list[dict] = []
+        vless_candidate_count = 0
         async with httpx.AsyncClient(
             timeout=_DIRECT_TIMEOUT,
             follow_redirects=False,
             trust_env=False,
             headers={"User-Agent": "X4G-Ramzinex-AutoEgress/1.0", "Accept": "application/json"},
         ) as direct_client:
+            # Active VLESS routes are revalidated first, then fresh Iranian-exit
+            # candidates are started one at a time. The public source is only a
+            # discovery hint; GeoIP + Ramzinex REST + Centrifuge checks are gates.
+            try:
+                active_vless = await _vless_egress_manager.active_candidates()
+                discovered_vless = []
+                if os.environ.get("RAMZINEX_VLESS_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off"):
+                    discovered_vless = await _vless_egress_manager.fetch_candidates(
+                        direct_client, limit=_RAMZINEX_VLESS_VERIFY_LIMIT
+                    )
+                combined_vless = []
+                seen_vless = set()
+                for spec in active_vless + discovered_vless:
+                    key = str(spec.get("key") or "")
+                    if key and key not in seen_vless:
+                        seen_vless.add(key)
+                        combined_vless.append(spec)
+                vless_candidate_count = len(combined_vless)
+                for spec in combined_vless[:_RAMZINEX_VLESS_VERIFY_LIMIT]:
+                    route = await _vless_egress_manager.start(spec)
+                    if route is None:
+                        continue
+                    candidate = route.candidate()
+                    candidate["key"] = route.key
+                    row = await _test_http_proxy(candidate, direct_client)
+                    if (
+                        row.get("ramzinex_ready") is True
+                        and row.get("geoip", {}).get("iran_confirmed") is True
+                    ):
+                        row["vless_route"] = True
+                        row["vless_key"] = route.key
+                        vless_rows.append(row)
+                    else:
+                        await _vless_egress_manager.stop(route.proxy_url)
+            except Exception as exc:
+                logger.warning("VLESS egress discovery failed type=%s", type(exc).__name__)
+
             try:
                 source_response = await direct_client.get(HTTP_PROXY_SOURCE, timeout=12.0)
                 source_response.raise_for_status()
@@ -1031,13 +1073,15 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
                     return await _test_http_proxy(candidate, direct_client)
 
             rows = await asyncio.gather(*(bounded(candidate) for candidate in candidates))
-        
+
+        rows = vless_rows + rows
         http_ready = [
             row for row in rows
             if row.get("ramzinex_ready") is True
             and row.get("geoip", {}).get("iran_confirmed") is True
         ]
         http_ready.sort(key=lambda row: (
+            not row.get("vless_route"),
             row.get("proxy") != UPSTREAM_PROXY,
             row.get("latency_ms", 999999),
         ))
@@ -1053,6 +1097,8 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
                 if ok:
                     row["websocket_ready"] = True
                     return row
+                if row.get("vless_route"):
+                    await _vless_egress_manager.stop(str(row["proxy"]))
                 return None
 
         ws_results = await asyncio.gather(*(
@@ -1060,10 +1106,14 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
         ))
         ready = [row for row in ws_results if row]
         ready.sort(key=lambda row: (
+            not row.get("vless_route"),
             row.get("proxy") != UPSTREAM_PROXY,
             row.get("latency_ms", 999999),
         ))
         selected = ready[:_RAMZINEX_PROXY_POOL_SIZE]
+        await _vless_egress_manager.keep_only({
+            str(row["proxy"]) for row in selected if row.get("vless_route")
+        })
         _ramzinex_proxy_urls = [str(row["proxy"]) for row in selected]
         _ramzinex_proxy_checked_at = time.monotonic()
 
@@ -1089,9 +1139,13 @@ async def refresh_ramzinex_proxy_pool(force: bool = False) -> dict:
             "http_ready_count": len(http_ready),
             "websocket_tested_count": min(len(http_ready), _RAMZINEX_WS_VERIFY_LIMIT),
             "websocket_ready_count": len(ready),
+            "vless_candidate_count": vless_candidate_count,
+            "vless_rest_ready_count": len(vless_rows),
+            "vless_websocket_ready_count": sum(1 for row in ready if row.get("vless_route")),
         })
         _ramzinex_proxy_status["proxyspace_source_errors"] = proxyspace_errors
         _ramzinex_proxy_status["http_candidate_limit"] = _RAMZINEX_HTTP_VERIFY_LIMIT
+        _ramzinex_proxy_status["vless_candidate_limit"] = _RAMZINEX_VLESS_VERIFY_LIMIT
         return {**_ramzinex_proxy_status, "cached": False}
 
 
@@ -1117,6 +1171,8 @@ async def _mark_ramzinex_proxy_failed(proxy_url: str) -> None:
             len(_ramzinex_proxy_urls),
             "a_previously_verified_route_failed",
         )
+    if proxy_url.startswith("socks5://127.0.0.1:"):
+        await _vless_egress_manager.stop(proxy_url)
 
 
 async def _ramzinex_proxy_maintenance_loop() -> None:
@@ -1174,6 +1230,7 @@ async def stop_proxy_manager() -> None:
     if task is not None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    await _vless_egress_manager.stop_all()
 
 
 async def _get_egress_ip_via_pool() -> dict:
