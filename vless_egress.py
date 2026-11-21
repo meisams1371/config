@@ -378,7 +378,7 @@ class VlessEgressManager:
         urls = [x.strip() for x in configured.split(";") if x.strip()] if configured else list(DEFAULT_SOURCE_URLS)
         parsed: list[dict] = []
         seen: set[str] = set()
-        per_source_limit = max(limit, min(24, limit * 2))
+        per_source_limit = 64
         for url in urls[:4]:
             try:
                 response = await direct_client.get(url, timeout=12.0)
