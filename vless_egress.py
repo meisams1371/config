@@ -153,7 +153,13 @@ def parse_vless_uri(uri: str) -> dict | None:
         if flow:
             user["flow"] = flow
 
-        stream: dict = {"network": network, "security": security}
+        method = {
+            "raw": "raw",
+            "ws": "websocket",
+            "grpc": "grpc",
+            "httpupgrade": "httpupgrade",
+        }[network]
+        stream: dict = {"method": method, "security": security}
         if security == "tls":
             alpn = [x.strip() for x in _first(params, "alpn").split(",") if x.strip()]
             tls = {"serverName": sni, "fingerprint": fingerprint, "allowInsecure": False}
@@ -168,7 +174,7 @@ def parse_vless_uri(uri: str) -> dict | None:
             stream["realitySettings"] = {
                 "serverName": sni,
                 "fingerprint": fingerprint,
-                "publicKey": public_key,
+                "password": public_key,
                 "shortId": short_id,
                 "spiderX": _first(params, "spx", "/")[:256],
             }
