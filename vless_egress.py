@@ -112,6 +112,8 @@ def parse_vless_uri(uri: str) -> dict | None:
     try:
         parsed = urlsplit(line)
         client_uuid = unquote(parsed.username or "")
+        if parsed.password is not None:
+            return None
         host = parsed.hostname or ""
         port = parsed.port
         uuidlib.UUID(client_uuid)
@@ -139,9 +141,12 @@ def parse_vless_uri(uri: str) -> dict | None:
         if network not in ("raw", "ws", "grpc", "httpupgrade"):
             # Unsupported transports are rejected rather than guessed.
             return None
+        # Xray REALITY is supported only with RAW and gRPC in the pinned core.
+        if security == "reality" and network not in ("raw", "grpc"):
+            return None
 
         flow = _first(params, "flow")
-        if flow and (flow != "xtls-rprx-vision" or network != "raw" or security != "reality"):
+        if flow and (flow != "xtls-rprx-vision" or network != "raw"):
             return None
 
         user = {"id": client_uuid, "encryption": "none"}
@@ -211,11 +216,11 @@ def parse_vless_uri(uri: str) -> dict | None:
                 "tag": "x4g-vless-out",
                 "protocol": "vless",
                 "settings": {
-                    "vnext": [{
-                        "address": host,
-                        "port": port,
-                        "users": [user],
-                    }]
+                    "address": host,
+                    "port": port,
+                    "id": client_uuid,
+                    "encryption": "none",
+                    "flow": flow,
                 },
                 "streamSettings": stream,
             }],
