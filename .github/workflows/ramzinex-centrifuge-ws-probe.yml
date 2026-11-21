@@ -5,12 +5,16 @@ on:
   push:
     branches:
       - ramzinex-x4g-iran-egress
+      - ramzinex-vless-iran-failover
     paths:
       - "scripts/ramzinex-centrifuge-probe.mjs"
       - "scripts/ramzinex-relay-live-smoke.py"
       - "ramzinex_relay_smoke_server.py"
       - ".github/workflows/ramzinex-centrifuge-ws-probe.yml"
       - "relay_app.py"
+      - "vless_egress.py"
+      - "scripts/test_vless_egress.py"
+      - "scripts/ramzinex-vless-live-smoke.py"
       - "requirements.txt"
 
 permissions:
