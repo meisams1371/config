@@ -62,6 +62,32 @@ def main():
 
     asyncio.run(check_ip_pinning())
 
+    # Failed public nodes are skipped during the cooldown so repeated refreshes
+    # advance to different source entries instead of retrying the same dead node.
+    from vless_egress import VlessEgressManager
+
+    async def check_failure_cooldown():
+        test_manager = VlessEgressManager()
+        reality_key = reality["key"]
+
+        class FakeResponse:
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        class FakeClient:
+            async def get(self, url, timeout=None):
+                return FakeResponse(REALITY + "\\n" + TLS_WS)
+
+        await test_manager._remember_failure(reality_key)
+        available = await test_manager.fetch_candidates(FakeClient(), limit=5)
+        assert all(item["key"] != reality_key for item in available)
+        assert any(item["network"] == "ws" for item in available)
+
+    asyncio.run(check_failure_cooldown())
+
     rows = parse_vless_source(REALITY + "\n" + REALITY + "\n" + TLS_WS, limit=5)
     assert len(rows) == 2, len(rows)
 
