@@ -329,7 +329,7 @@ class VlessEgressManager:
 
     async def active_candidates(self) -> list[dict]:
         async with self._lock:
-            return [route.candidate() for route in self._routes.values()
+            return [{**route.candidate(), "key": route.key} for route in self._routes.values()
                     if route.process.returncode is None]
 
     async def start(self, candidate: dict) -> ManagedVlessRoute | None:
