@@ -1,10 +1,11 @@
+import asyncio
 import uuid
 
-from vless_egress import parse_vless_source, parse_vless_uri
+from vless_egress import _resolve_public_server_ip, parse_vless_source, parse_vless_uri
 
 
 REALITY = (
-    f"vless://{uuid.uuid4()}@203.0.113.10:443"
+    f"vless://{uuid.uuid4()}@8.8.8.8:443"
     "?encryption=none&security=reality&type=tcp&flow=xtls-rprx-vision"
     "&sni=www.example.com&fp=chrome&pbk=abcdefghijklmnopqrstuv"
     "&sid=abcd1234"
@@ -50,6 +51,16 @@ def main():
     assert parse_vless_uri(f"vless://not-a-uuid@example.com:443?security=tls&sni=example.com&type=tcp") is None
     assert parse_vless_uri(f"vless://{uuid.uuid4()}@example.com:443?security=none&sni=example.com&type=xhttp") is None
     assert parse_vless_uri(f"vless://{uuid.uuid4()}@example.com:443?security=tls&sni=example.com&type=unknown") is None
+
+    assert parse_vless_uri(f"vless://{uuid.uuid4()}@127.0.0.1:443?security=tls&sni=example.com&type=tcp") is None
+    assert parse_vless_uri(f"vless://{uuid.uuid4()}@169.254.169.254:443?security=tls&sni=example.com&type=tcp") is None
+
+    async def check_ip_pinning():
+        assert await _resolve_public_server_ip("8.8.8.8", 443) == "8.8.8.8"
+        assert await _resolve_public_server_ip("127.0.0.1", 443) is None
+        assert await _resolve_public_server_ip("169.254.169.254", 443) is None
+
+    asyncio.run(check_ip_pinning())
 
     rows = parse_vless_source(REALITY + "\n" + REALITY + "\n" + TLS_WS, limit=5)
     assert len(rows) == 2, len(rows)
