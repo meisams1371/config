@@ -9,6 +9,11 @@ REALITY = (
     "&sni=www.example.com&fp=chrome&pbk=abcdefghijklmnopqrstuv"
     "&sid=abcd1234"
 )
+REALITY_XHTTP = (
+    f"vless://{uuid.uuid4()}@xhttp.example.com:443"
+    "?encryption=none&security=reality&type=xhttp&sni=xhttp.example.com"
+    "&pbk=abcdefghijklmnopqrstuv&sid=abcd1234&path=%2Ffeed&mode=auto"
+)
 TLS_WS = (
     f"vless://{uuid.uuid4()}@edge.example.com:8443"
     "?encryption=none&security=tls&type=ws&sni=edge.example.com"
@@ -33,10 +38,18 @@ def main():
     assert ws["config"]["outbounds"][0]["streamSettings"]["wsSettings"]["path"] == "/vless"
     assert ws["config"]["outbounds"][0]["streamSettings"]["tlsSettings"]["allowInsecure"] is False
 
+    xhttp = parse_vless_uri(REALITY_XHTTP)
+    assert xhttp is not None
+    assert xhttp["network"] == "xhttp"
+    assert xhttp["config"]["outbounds"][0]["streamSettings"]["method"] == "xhttp"
+    assert xhttp["config"]["outbounds"][0]["streamSettings"]["xhttpSettings"]["path"] == "/feed"
+    assert xhttp["config"]["outbounds"][0]["streamSettings"]["xhttpSettings"]["mode"] == "auto"
+
     # The manager deliberately rejects unencrypted and unsupported nodes.
     assert parse_vless_uri(f"vless://{uuid.uuid4()}@example.com:80?security=none&type=ws") is None
     assert parse_vless_uri(f"vless://not-a-uuid@example.com:443?security=tls&sni=example.com&type=tcp") is None
-    assert parse_vless_uri(f"vless://{uuid.uuid4()}@example.com:443?security=tls&sni=example.com&type=xhttp") is None
+    assert parse_vless_uri(f"vless://{uuid.uuid4()}@example.com:443?security=none&sni=example.com&type=xhttp") is None
+    assert parse_vless_uri(f"vless://{uuid.uuid4()}@example.com:443?security=tls&sni=example.com&type=unknown") is None
 
     rows = parse_vless_source(REALITY + "\n" + REALITY + "\n" + TLS_WS, limit=5)
     assert len(rows) == 2, len(rows)
