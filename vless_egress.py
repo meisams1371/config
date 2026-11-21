@@ -359,6 +359,7 @@ class VlessEgressManager:
         self._lock = asyncio.Lock()
         self._binary_lock = asyncio.Lock()
         self._binary_path: str | None = None
+        self._binary_failure_until = 0.0
 
     async def _remember_failure(self, key: str) -> None:
         if key:
@@ -369,8 +370,19 @@ class VlessEgressManager:
         async with self._binary_lock:
             if self._binary_path and os.path.isfile(self._binary_path):
                 return self._binary_path
-            binary = await asyncio.to_thread(_xray_binary)
+            now = asyncio.get_running_loop().time()
+            if now < self._binary_failure_until:
+                return None
+            try:
+                binary = await asyncio.to_thread(_xray_binary)
+            except Exception:
+                # Avoid re-downloading a 16 MB release for every node when
+                # GitHub is temporarily unreachable or the checksum fails.
+                self._binary_failure_until = now + 300
+                return None
             self._binary_path = binary
+            if not binary:
+                self._binary_failure_until = now + 300
             return binary
 
     async def fetch_candidates(self, direct_client, limit: int = MAX_SOURCE_CANDIDATES) -> list[dict]:
