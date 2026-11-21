@@ -84,8 +84,7 @@ def _valid_host(host: str) -> bool:
     if not host or len(host) > 253 or any(ch in host for ch in "\r\n\t /@"):
         return False
     try:
-        ipaddress.ip_address(host)
-        return True
+        return ipaddress.ip_address(host).is_global
     except ValueError:
         try:
             encoded = host.encode("idna").decode("ascii")
@@ -276,6 +275,33 @@ def parse_vless_source(contents: str, limit: int = MAX_SOURCE_CANDIDATES) -> lis
     return rows
 
 
+async def _resolve_public_server_ip(host: str, port: int) -> str | None:
+    """Resolve untrusted share-link hosts and pin Xray to a public address only."""
+    try:
+        address = ipaddress.ip_address(host)
+        return address.compressed if address.is_global else None
+    except ValueError:
+        pass
+    try:
+        results = await asyncio.get_running_loop().getaddrinfo(
+            host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+        )
+    except Exception:
+        return None
+    addresses = []
+    for item in results:
+        try:
+            resolved = ipaddress.ip_address(str(item[4][0]))
+            if not resolved.is_global:
+                # Reject the whole hostname if any answer points into a private,
+                # loopback, link-local, reserved or otherwise non-global range.
+                return None
+            addresses.append(resolved.compressed)
+        except Exception:
+            return None
+    return addresses[0] if addresses else None
+
+
 def _xray_binary() -> str | None:
     custom = os.environ.get("X4G_XRAY_BINARY", "").strip()
     if custom:
@@ -371,6 +397,14 @@ class VlessEgressManager:
             return None
 
         try:
+            server_host = str(candidate.get("host") or "")
+            server_port = int(candidate.get("port") or 0)
+            if not _valid_host(server_host) or not (1 <= server_port <= 65535):
+                return None
+            pinned_server_ip = await _resolve_public_server_ip(server_host, server_port)
+            if not pinned_server_ip:
+                return None
+
             binary = await asyncio.to_thread(_xray_binary)
             if not binary:
                 return None
@@ -382,6 +416,9 @@ class VlessEgressManager:
             work_dir = tempfile.mkdtemp(prefix="x4g-vless-")
             config = json.loads(json.dumps(candidate["config"]))
             config["inbounds"][0]["port"] = local_port
+            # Pin to the vetted public IP to prevent DNS rebinding to local
+            # metadata/control-plane addresses after validation.
+            config["outbounds"][0]["settings"]["address"] = pinned_server_ip
             config_path = os.path.join(work_dir, "config.json")
             with open(config_path, "w", encoding="utf-8") as handle:
                 json.dump(config, handle, ensure_ascii=False)
