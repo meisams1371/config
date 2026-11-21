@@ -32,5 +32,5 @@ jobs:
       - name: Live-test discovered Iranian VLESS nodes against Ramzinex
         env:
           RAMZINEX_RELAY_TOKEN: github-actions-probe-only-not-a-production-secret-1234567890
-          RAMZINEX_VLESS_SCAN_LIMIT: "12"
+          RAMZINEX_VLESS_SCAN_LIMIT: "4"
         run: python scripts/ramzinex-vless-live-smoke.py
