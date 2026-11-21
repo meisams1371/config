@@ -32,6 +32,9 @@ DEFAULT_SOURCE_URLS = (
 )
 MAX_SOURCE_CANDIDATES = max(1, min(24, int(os.environ.get("RAMZINEX_VLESS_SCAN_LIMIT", "12"))))
 SOCKS_START_TIMEOUT = 10.0
+FAILURE_COOLDOWN_SECONDS = max(
+    60, min(3600, int(os.environ.get("RAMZINEX_VLESS_FAILURE_COOLDOWN_SECONDS", "900")))
+)
 
 # Official XTLS/Xray-core release checksums for the pinned release.
 XRAY_ASSETS = {
@@ -352,7 +355,23 @@ class VlessEgressManager:
 
     def __init__(self) -> None:
         self._routes: dict[str, ManagedVlessRoute] = {}
+        self._failed_until: dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self._binary_lock = asyncio.Lock()
+        self._binary_path: str | None = None
+
+    async def _remember_failure(self, key: str) -> None:
+        if key:
+            async with self._lock:
+                self._failed_until[key] = asyncio.get_running_loop().time() + FAILURE_COOLDOWN_SECONDS
+
+    async def _get_binary(self) -> str | None:
+        async with self._binary_lock:
+            if self._binary_path and os.path.isfile(self._binary_path):
+                return self._binary_path
+            binary = await asyncio.to_thread(_xray_binary)
+            self._binary_path = binary
+            return binary
 
     async def fetch_candidates(self, direct_client, limit: int = MAX_SOURCE_CANDIDATES) -> list[dict]:
         configured = os.environ.get("RAMZINEX_VLESS_SOURCE_URLS", "").strip()
@@ -370,6 +389,16 @@ class VlessEgressManager:
                         parsed.append(row)
             except Exception:
                 continue
+        # Cool down nodes that have failed recently so each refresh advances
+        # through the source pool instead of retrying the same dead first entries.
+        now = asyncio.get_running_loop().time()
+        async with self._lock:
+            self._failed_until = {
+                key: until for key, until in self._failed_until.items() if until > now
+            }
+            cooling_down = set(self._failed_until)
+
+        parsed = [row for row in parsed if row["key"] not in cooling_down]
         # Prefer REALITY nodes and transports with complete link parameters.
         # Live IP, REST and WebSocket checks remain the only admission gates.
         parsed.sort(key=lambda row: (
@@ -386,12 +415,16 @@ class VlessEgressManager:
 
     async def start(self, candidate: dict) -> ManagedVlessRoute | None:
         key = str(candidate.get("key") or "")
+        dead_route = None
         async with self._lock:
             existing = self._routes.get(key)
             if existing and existing.process.returncode is None:
                 return existing
             if existing:
                 self._routes.pop(key, None)
+                dead_route = existing
+        if dead_route:
+            await self._stop_route(dead_route)
 
         if not key or not candidate.get("config"):
             return None
@@ -403,9 +436,10 @@ class VlessEgressManager:
                 return None
             pinned_server_ip = await _resolve_public_server_ip(server_host, server_port)
             if not pinned_server_ip:
+                await self._remember_failure(key)
                 return None
 
-            binary = await asyncio.to_thread(_xray_binary)
+            binary = await self._get_binary()
             if not binary:
                 return None
 
@@ -458,6 +492,7 @@ class VlessEgressManager:
                 self._routes[key] = route
             return route
         except Exception:
+            await self._remember_failure(key)
             try:
                 if "process" in locals() and process.returncode is None:
                     process.terminate()
@@ -472,11 +507,13 @@ class VlessEgressManager:
                 shutil.rmtree(work_dir, ignore_errors=True)
             return None
 
-    async def stop(self, proxy_url: str) -> None:
+    async def stop(self, proxy_url: str, quarantine: bool = True) -> None:
         async with self._lock:
             key = next((key for key, route in self._routes.items()
                         if route.proxy_url == proxy_url), None)
             route = self._routes.pop(key, None) if key else None
+            if route and quarantine:
+                self._failed_until[key] = asyncio.get_running_loop().time() + FAILURE_COOLDOWN_SECONDS
         if route:
             await self._stop_route(route)
 
