@@ -24,7 +24,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
-XRAY_VERSION = os.environ.get("X4G_XRAY_VERSION", "v26.10.31")
+XRAY_VERSION = "v26.10.31"
 XRAY_RELEASE_BASE = f"https://github.com/XTLS/Xray-core/releases/download/{XRAY_VERSION}"
 DEFAULT_SOURCE_URLS = (
     "https://raw.githubusercontent.com/mmbateni/iran-intranet-access/main/outputs/ir_exit_configs.txt",
@@ -41,7 +41,7 @@ XRAY_ASSETS = {
     ),
     "amd64": (
         "Xray-linux-64.zip",
-        "b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82",
+        "e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214",
     ),
     "aarch64": (
         "Xray-linux-arm64-v8a.zip",
@@ -49,7 +49,7 @@ XRAY_ASSETS = {
     ),
     "arm64": (
         "Xray-linux-arm64-v8a.zip",
-        "64ed6858982a7f5eb85d88b811089063bd4f17561f4c8f44e0f1dc8e6f6430be",
+        "1811c8f1da0c3b6dc707ebaf1c8390e987ba39859a8f0a7aadd8526157f2ec8d",
     ),
 }
 
@@ -148,10 +148,6 @@ def parse_vless_uri(uri: str) -> dict | None:
         flow = _first(params, "flow")
         if flow and (flow != "xtls-rprx-vision" or network != "raw"):
             return None
-
-        user = {"id": client_uuid, "encryption": "none"}
-        if flow:
-            user["flow"] = flow
 
         method = {
             "raw": "raw",
@@ -337,19 +333,25 @@ class VlessEgressManager:
         urls = [x.strip() for x in configured.split(";") if x.strip()] if configured else list(DEFAULT_SOURCE_URLS)
         parsed: list[dict] = []
         seen: set[str] = set()
+        per_source_limit = max(limit, min(24, limit * 2))
         for url in urls[:4]:
             try:
                 response = await direct_client.get(url, timeout=12.0)
                 response.raise_for_status()
-                for row in parse_vless_source(response.text, limit=limit):
+                for row in parse_vless_source(response.text, limit=per_source_limit):
                     if row["key"] not in seen:
                         seen.add(row["key"])
                         parsed.append(row)
-                    if len(parsed) >= limit:
-                        return parsed
             except Exception:
                 continue
-        return parsed
+        # Prefer REALITY nodes and transports with complete link parameters.
+        # Live IP, REST and WebSocket checks remain the only admission gates.
+        parsed.sort(key=lambda row: (
+            row["security"] != "reality",
+            row["network"] not in ("raw", "xhttp", "grpc"),
+            not bool(row["config"]["outbounds"][0]["settings"].get("flow")),
+        ))
+        return parsed[:limit]
 
     async def active_candidates(self) -> list[dict]:
         async with self._lock:
