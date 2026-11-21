@@ -1,0 +1,31 @@
+name: X4G Iranian VLESS relay validation
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate-vless-egress:
+    if: github.event.pull_request.head.ref == 'ramzinex-vless-iran-failover'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install project dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - name: Compile application and VLESS egress modules
+        run: python -m py_compile main.py relay_app.py vless_egress.py scripts/test_vless_egress.py scripts/ramzinex-vless-live-smoke.py
+      - name: Test VLESS, REALITY, TLS, XHTTP parsing and rejection rules
+        run: python scripts/test_vless_egress.py
+      - name: Live-test discovered Iranian VLESS nodes against Ramzinex
+        env:
+          RAMZINEX_RELAY_TOKEN: github-actions-probe-only-not-a-production-secret-1234567890
+          RAMZINEX_VLESS_SCAN_LIMIT: "12"
+        run: python scripts/ramzinex-vless-live-smoke.py
