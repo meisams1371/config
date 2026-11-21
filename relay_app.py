@@ -1171,7 +1171,7 @@ async def _mark_ramzinex_proxy_failed(proxy_url: str) -> None:
             len(_ramzinex_proxy_urls),
             "a_previously_verified_route_failed",
         )
-    if proxy_url.startswith("socks5h://127.0.0.1:"):
+    if proxy_url.startswith("socks5://127.0.0.1:"):
         await _vless_egress_manager.stop(proxy_url)
 
 
