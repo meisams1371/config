@@ -430,7 +430,7 @@ class VlessEgressManager:
             )
             route = ManagedVlessRoute(
                 key=key,
-                proxy_url=f"socks5h://127.0.0.1:{local_port}",
+                proxy_url=f"socks5://127.0.0.1:{local_port}",
                 server_host=str(candidate.get("host") or ""),
                 server_port=int(candidate.get("port") or 0),
                 process=process,
