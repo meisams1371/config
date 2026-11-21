@@ -23,11 +23,13 @@ def main():
     assert reality["network"] == "raw"
     assert reality["config"]["outbounds"][0]["protocol"] == "vless"
     assert reality["config"]["inbounds"][0]["listen"] == "127.0.0.1"
-    assert reality["config"]["outbounds"][0]["streamSettings"]["realitySettings"]["publicKey"]
+    assert reality["config"]["outbounds"][0]["streamSettings"]["method"] == "raw"
+    assert reality["config"]["outbounds"][0]["streamSettings"]["realitySettings"]["password"]
 
     ws = parse_vless_uri(TLS_WS)
     assert ws is not None
     assert ws["network"] == "ws"
+    assert ws["config"]["outbounds"][0]["streamSettings"]["method"] == "websocket"
     assert ws["config"]["outbounds"][0]["streamSettings"]["wsSettings"]["path"] == "/vless"
     assert ws["config"]["outbounds"][0]["streamSettings"]["tlsSettings"]["allowInsecure"] is False
 
