@@ -79,7 +79,7 @@ def main():
 
         class FakeClient:
             async def get(self, url, timeout=None):
-                return FakeResponse(REALITY + "\\n" + TLS_WS)
+                return FakeResponse(REALITY + "\n" + TLS_WS)
 
         await test_manager._remember_failure(reality_key)
         available = await test_manager.fetch_candidates(FakeClient(), limit=5)
